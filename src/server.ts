@@ -35,6 +35,10 @@ function main(): void {
   }).listen(port, () => console.log(`[bot] Health endpoint on :${port}`));
 
   startTelegramPolling(handleBotUpdate);
+  // On a free Render instance, inbound traffic is what keeps the process awake. A ping every five
+  // minutes from inside counts, so polling never stops. Harmless on a paid instance.
+  const self = process.env.RENDER_EXTERNAL_URL;
+  if (self) setInterval(() => fetch(`${self}/api/health`).catch(() => {}), 5 * 60_000).unref();
   const heartbeat = setInterval(() => botHeartbeat().catch((error) => console.error("[bot] heartbeat", error instanceof Error ? error.message : error)), HEARTBEAT_MS);
   heartbeat.unref();
   console.log(`[bot] Live trading on this server: ${env.liveTrading ? "on" : "off"}`);
