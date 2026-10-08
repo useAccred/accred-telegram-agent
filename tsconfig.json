@@ -1,0 +1,42 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": [
+      "es2023",
+      "dom"
+    ],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "types": [
+      "node"
+    ],
+    "baseUrl": ".",
+    "paths": {
+      "@lib/*": [
+        "vendor/accred-automation/src/lib/*"
+      ],
+      "@/*": [
+        "vendor/accred-automation/src/*"
+      ]
+    }
+  },
+  "include": [
+    "src/**/*.ts",
+    "vendor/accred-automation/src/lib/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "vendor/accred-automation/node_modules",
+    "vendor/accred-automation/src/lib/bot/**",
+    "vendor/accred-automation/src/lib/auth.ts",
+    "vendor/accred-automation/src/lib/balance.ts",
+    "vendor/accred-automation/src/lib/origin.ts",
+    "vendor/accred-automation/src/lib/scheduler.ts"
+  ]
+}

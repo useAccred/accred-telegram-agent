@@ -1,0 +1,22 @@
+# The Telegram agent as its own always-on service. Set the secrets in the dashboard; they must
+# match the web app's (DATABASE_URL, APP_SECRET, TRADING_WALLET_SECRET, LIVE_TRADING).
+services:
+  - type: web
+    name: accred-telegram-agent
+    runtime: node
+    plan: starter
+    region: singapore
+    buildCommand: git submodule update --init --recursive && pnpm install --frozen-lockfile --prod=false
+    startCommand: pnpm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: 22.12.0
+      - key: DATABASE_URL
+        sync: false
+      - key: APP_SECRET
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: LIVE_TRADING
+        sync: false

@@ -1,0 +1,4 @@
+[submodule "vendor/accred-automation"]
+	path = vendor/accred-automation
+	url = https://github.com/useAccred/accred-automation.git
+	branch = trading-agent
