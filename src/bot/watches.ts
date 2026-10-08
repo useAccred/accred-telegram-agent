@@ -3,6 +3,7 @@ import { botWatches, db, positions, runs, automations, tradingAutomations, type 
 import { fetchSnapshots } from "@lib/trading/market-data";
 import { resolveAssets } from "@lib/trading/create";
 import { USDG, WETH } from "@lib/trading/chain";
+import { CRED } from "./cred";
 import { fmtPrice, fmtUsd, signedUsd } from "@lib/trading/format";
 import { timeAgo } from "@lib/format";
 
@@ -38,8 +39,16 @@ export interface ParsedWatch {
   agent?: string;
 }
 
-/** Wrapped tokens stand in for the natives the user names; the chain's own addresses are tried last. */
-const SYMBOL_ALIASES: Record<string, string[]> = { ETH: ["WETH", WETH.address], WETH: [WETH.address], BTC: ["WBTC", "CBBTC"], USD: ["USDG", USDG.address], USDG: [USDG.address] };
+/** Tokens the bot knows without asking a price provider: the chain's own, so an alert on them always sets. */
+const KNOWN_TOKENS: Record<string, { address: string; symbol: string }> = {
+  ETH: WETH,
+  WETH,
+  USDG,
+  USD: USDG,
+  CRED,
+};
+/** Wrapped tokens stand in for the natives the user names. */
+const SYMBOL_ALIASES: Record<string, string[]> = { BTC: ["WBTC", "CBBTC"] };
 
 /**
  * "ETH below 2000", "eth < 2000", "alert me when btc goes above 70k",
@@ -66,11 +75,17 @@ export function parseWatch(text: string): ParsedWatch | null {
   return null;
 }
 
-/** Finds the token for a symbol, trying the wrapped form when the native name is not listed. */
+/** Finds the token for a symbol: the chain's own tokens first, then the top list, then wrapped forms. */
 async function resolveSymbol(symbol: string): Promise<{ address: string; symbol: string } | null> {
-  const candidates = [symbol, ...(SYMBOL_ALIASES[symbol.toUpperCase()] ?? [])];
-  for (const candidate of candidates) {
-    const { assets } = await resolveAssets([candidate]);
+  const upper = symbol.toUpperCase();
+  if (/^0x[0-9a-f]{40}$/i.test(symbol)) {
+    const { assets } = await resolveAssets([symbol]);
+    return assets[0] ? { address: assets[0].address, symbol: assets[0].symbol } : { address: symbol.toLowerCase(), symbol: symbol.slice(0, 6) };
+  }
+  const known = KNOWN_TOKENS[upper];
+  if (known) return { address: known.address, symbol: known.symbol };
+  for (const candidate of [upper, ...(SYMBOL_ALIASES[upper] ?? [])]) {
+    const { assets } = await resolveAssets([candidate]).catch(() => ({ assets: [] as Array<{ address: string; symbol: string }> }));
     if (assets[0]) return { address: assets[0].address, symbol: assets[0].symbol };
   }
   return null;
@@ -90,7 +105,7 @@ export async function createWatch(chat: BotChat, user: User, parsed: ParsedWatch
   let agentId: string | null = null;
   if (parsed.kind === "price_below" || parsed.kind === "price_above") {
     const asset = await resolveSymbol(parsed.symbol!);
-    if (!asset) throw new WatchError(`I could not find "${parsed.symbol}" on Robinhood Chain. Use a symbol from the top list (ask "which assets trade?") or a 0x address.`);
+    if (!asset) throw new WatchError(`I could not find "${parsed.symbol}" on Robinhood Chain right now. ETH, USDG and CRED always work; for other tokens use a symbol from the top list (ask "which assets trade?") or its 0x address. If the price providers are busy, try again in a minute.`);
     assetAddress = asset.address;
     assetSymbol = asset.symbol;
     if (!(parsed.threshold! > 0)) throw new WatchError("Give a price above zero.");
