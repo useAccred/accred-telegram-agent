@@ -2,6 +2,7 @@ import { and, desc, eq, gte, inArray } from "drizzle-orm";
 import { botWatches, db, positions, runs, automations, tradingAutomations, type BotChat, type BotWatch, type BotWatchKind, type User } from "@lib/db";
 import { fetchSnapshots } from "@lib/trading/market-data";
 import { resolveAssets } from "@lib/trading/create";
+import { USDG, WETH } from "@lib/trading/chain";
 import { fmtPrice, fmtUsd, signedUsd } from "@lib/trading/format";
 import { timeAgo } from "@lib/format";
 
@@ -37,21 +38,40 @@ export interface ParsedWatch {
   agent?: string;
 }
 
-/** "ETH below 2000", "btc > 70k", "position closed", "run failed", "agent paused Momentum". */
+/** Wrapped tokens stand in for the natives the user names; the chain's own addresses are tried last. */
+const SYMBOL_ALIASES: Record<string, string[]> = { ETH: ["WETH", WETH.address], WETH: [WETH.address], BTC: ["WBTC", "CBBTC"], USD: ["USDG", USDG.address], USDG: [USDG.address] };
+
+/**
+ * "ETH below 2000", "eth < 2000", "alert me when btc goes above 70k",
+ * "cred falls to 0.05", "position closed", "run failed", "agent paused Momentum".
+ * Case never matters.
+ */
 export function parseWatch(text: string): ParsedWatch | null {
-  const clean = text.trim().replace(/[$,]/g, "");
-  const price = /^([a-z0-9.]{2,16}|0x[0-9a-f]{40})\s*(below|under|<|drops? (?:to|below)|above|over|>|rises? (?:to|above))\s*([0-9]+(?:\.[0-9]+)?)\s*(k|m)?$/i.exec(clean);
+  let clean = text.trim().replace(/[$,]/g, "").replace(/\s+/g, " ");
+  clean = clean.replace(/^(?:please\s+)?(?:tell me|notify me|alert me|ping me|warn me|alert|notify|watch)?\s*(?:when|if|once)?\s*(?:the\s+)?(?:price of\s+)?/i, "").trim();
+  const price = /^([a-z0-9.]{2,16}|0x[0-9a-f]{40})\s*(?:price\s*)?(?:is\s+|goes\s+|gets\s+|falls?\s+|drops?\s+|rises?\s+|climbs?\s+|moves?\s+)?(below|under|<|<=|to|above|over|>|>=|reaches|hits|crosses|past)\s*([0-9]+(?:\.[0-9]+)?)\s*(k|m)?\s*(?:usd|dollars?)?$/i.exec(clean);
   if (price) {
     const [, symbol, direction, amount, unit] = price;
     const factor = unit?.toLowerCase() === "k" ? 1_000 : unit?.toLowerCase() === "m" ? 1_000_000 : 1;
-    const below = /below|under|<|drop/i.test(direction!);
+    const verb = /falls?|drops?/i.exec(clean)?.[0];
+    const below = /below|under|^<=?$/i.test(direction!) || (direction!.toLowerCase() === "to" && Boolean(verb));
     return { kind: below ? "price_below" : "price_above", symbol: symbol!.toUpperCase(), threshold: Number(amount) * factor };
   }
-  const event = /^(position(?:s)? closed?|closed? position|run(?:s)? fail(?:ed|s)?|fail(?:ed)? runs?|agent(?:s)? (?:auto-?)?paused?|paused? agents?)(?:\s+(.+))?$/i.exec(clean);
+  const event = /^(?:a\s+|an\s+|any\s+)?(position(?:s)? (?:is |gets )?closed?|closed? position|run(?:s)? (?:is |gets )?fail(?:ed|s)?|fail(?:ed|ing)? runs?|automation(?:s)? fail(?:ed|s)?|agent(?:s)? (?:is |gets )?(?:auto-?)?paused?|paused? agents?)(?:\s+(?:for\s+|on\s+)?(.+))?$/i.exec(clean);
   if (event) {
     const [, which, agent] = event;
-    const kind: BotWatchKind = /position/i.test(which!) ? "position_closed" : /run|fail/i.test(which!) ? "run_failed" : "agent_paused";
+    const kind: BotWatchKind = /position/i.test(which!) ? "position_closed" : /run|fail|automation/i.test(which!) ? "run_failed" : "agent_paused";
     return { kind, agent: agent?.trim() || undefined };
+  }
+  return null;
+}
+
+/** Finds the token for a symbol, trying the wrapped form when the native name is not listed. */
+async function resolveSymbol(symbol: string): Promise<{ address: string; symbol: string } | null> {
+  const candidates = [symbol, ...(SYMBOL_ALIASES[symbol.toUpperCase()] ?? [])];
+  for (const candidate of candidates) {
+    const { assets } = await resolveAssets([candidate]);
+    if (assets[0]) return { address: assets[0].address, symbol: assets[0].symbol };
   }
   return null;
 }
@@ -69,10 +89,10 @@ export async function createWatch(chat: BotChat, user: User, parsed: ParsedWatch
   let assetSymbol: string | null = null;
   let agentId: string | null = null;
   if (parsed.kind === "price_below" || parsed.kind === "price_above") {
-    const { assets, unknown } = await resolveAssets([parsed.symbol!]);
-    if (unknown.length || !assets[0]) throw new WatchError(`I could not find "${parsed.symbol}" on Robinhood Chain. Use a symbol from the top list or a 0x address.`);
-    assetAddress = assets[0].address;
-    assetSymbol = assets[0].symbol;
+    const asset = await resolveSymbol(parsed.symbol!);
+    if (!asset) throw new WatchError(`I could not find "${parsed.symbol}" on Robinhood Chain. Use a symbol from the top list (ask "which assets trade?") or a 0x address.`);
+    assetAddress = asset.address;
+    assetSymbol = asset.symbol;
     if (!(parsed.threshold! > 0)) throw new WatchError("Give a price above zero.");
   } else if (parsed.agent) {
     const rows = await db.select({ id: tradingAutomations.id, name: tradingAutomations.name }).from(tradingAutomations).where(eq(tradingAutomations.userId, user.id));

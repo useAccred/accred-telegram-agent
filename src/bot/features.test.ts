@@ -11,6 +11,17 @@ describe("alert parsing", () => {
     expect(parseWatch("CRED drops to 0.05")).toEqual({ kind: "price_below", symbol: "CRED", threshold: 0.05 });
     expect(parseWatch("$eth above $2,500")).toEqual({ kind: "price_above", symbol: "ETH", threshold: 2500 });
   });
+  it("ignores case and chatty phrasing", () => {
+    expect(parseWatch("eth below 2000")).toEqual({ kind: "price_below", symbol: "ETH", threshold: 2000 });
+    expect(parseWatch("Eth Below 2000")).toEqual({ kind: "price_below", symbol: "ETH", threshold: 2000 });
+    expect(parseWatch("alert me when eth goes below 2000")).toEqual({ kind: "price_below", symbol: "ETH", threshold: 2000 });
+    expect(parseWatch("tell me if BTC rises above 70k usd")).toEqual({ kind: "price_above", symbol: "BTC", threshold: 70_000 });
+    expect(parseWatch("cred falls to 0.05")).toEqual({ kind: "price_below", symbol: "CRED", threshold: 0.05 });
+    expect(parseWatch("cred reaches 0.1")).toEqual({ kind: "price_above", symbol: "CRED", threshold: 0.1 });
+    expect(parseWatch("when a position is closed")).toEqual({ kind: "position_closed", agent: undefined });
+    expect(parseWatch("Run Failed")).toEqual({ kind: "run_failed", agent: undefined });
+    expect(parseWatch("agent paused for momentum a")).toEqual({ kind: "agent_paused", agent: "momentum a" });
+  });
   it("reads event watches, with an optional agent", () => {
     expect(parseWatch("position closed")).toEqual({ kind: "position_closed", agent: undefined });
     expect(parseWatch("run failed")).toEqual({ kind: "run_failed", agent: undefined });
