@@ -4,11 +4,11 @@ import { rateLimited } from "../rate-limit";
 import { encrypt, sha256 } from "@lib/crypto";
 import { db, users } from "@lib/db";
 import { consumeStartCode, saveSharedChat, type TelegramUpdate } from "@lib/telegram";
-import { handleCallback } from "./actions";
+import { decideAction, handleCallback } from "./actions";
 import { chatTurn, defaultBotDeps, type BotDeps } from "./agent";
 import { ASK_FOR_KEY, handleCommand, welcome } from "./commands";
 import { looksLikeKey, looksLikePrivateKey, parseCommand } from "./format";
-import { ensureChat, getChat, linkChat, loadLinkedChat, updateChat } from "./store";
+import { armedAction, ensureChat, getChat, linkChat, linkGroup, loadLinkedChat, unlinkChat, updateChat } from "./store";
 import { balanceLine } from "./tools";
 
 /**
@@ -18,6 +18,25 @@ import { balanceLine } from "./tools";
  */
 
 const queues = new Map<string, Promise<void>>();
+
+let botUsername = "";
+
+/** The bot's own username, so a group message can be recognised as addressed to it. */
+export function setBotIdentity(username: string): void {
+  botUsername = username.replace(/^@/, "");
+}
+
+/** True when a group message mentions the bot or replies to it. Returns the text with the mention removed. */
+export function addressedToBot(message: { text?: string; reply_to_message?: { from?: { username?: string } } }, username = botUsername): { addressed: boolean; text: string } {
+  const text = (message.text ?? "").trim();
+  if (!username) return { addressed: false, text };
+  const mention = new RegExp(`(^|\\s)@${username}\\b`, "i");
+  const replied = message.reply_to_message?.from?.username?.toLowerCase() === username.toLowerCase();
+  if (mention.test(text)) return { addressed: true, text: text.replace(mention, " ").replace(/\s+/g, " ").trim() };
+  // "/status@AccredAgentbot" is how Telegram addresses a command to one bot in a group.
+  if (new RegExp(`^/[a-z_]+@${username}\\b`, "i").test(text)) return { addressed: true, text };
+  return { addressed: replied, text };
+}
 
 function enqueue(chatId: string, work: () => Promise<void>): Promise<void> {
   const previous = queues.get(chatId) ?? Promise.resolve();
@@ -67,9 +86,12 @@ async function handleMessage(update: TelegramUpdate, deps: BotDeps): Promise<voi
     return;
   }
 
-  if (message.chat.type !== "private") return;
+  if (message.chat.type !== "private") {
+    await handleGroupMessage(update, deps);
+    return;
+  }
   if (!text) {
-    await api.sendMessage(chatId, "I can only read text for now. Voice notes and images are coming once the API supports them.");
+    await api.sendMessage(chatId, "I can only read text. Type what you need.");
     return;
   }
   if (rateLimited(`bot:${chatId}`, 20, 60_000)) {
@@ -99,6 +121,83 @@ async function handleMessage(update: TelegramUpdate, deps: BotDeps): Promise<voi
     const handled = await handleCommand(linked.chat, linked.user, command.command, command.arg, api);
     if (handled) return;
     // An unknown command is still a message to the agent.
+  }
+  if (await typedWord(chatId, text, api)) return;
+  await chatTurn(chatId, text, deps);
+}
+
+/** A confirmed close-all waits for the word CLOSE. The word runs it; anything else cancels it. */
+async function typedWord(chatId: string, text: string, api: BotDeps["api"]): Promise<boolean> {
+  const armed = await armedAction(chatId);
+  if (!armed) return false;
+  if (/^close$/i.test(text.trim())) {
+    await decideAction(armed.id, chatId, "confirmed", api);
+    return true;
+  }
+  await decideAction(armed.id, chatId, "cancelled", api);
+  await api.sendMessage(chatId, "Cancelled: nothing was sold. Your message was not sent to the agent; send it again if you meant it.");
+  return true;
+}
+
+/**
+ * A group uses one member's account. That member links it with /start; from
+ * then on the bot answers when mentioned or replied to, with the group's own
+ * tighter budget. Confirmations are the owner's alone (checked in actions).
+ */
+async function handleGroupMessage(update: TelegramUpdate, deps: BotDeps): Promise<void> {
+  const message = update.message!;
+  const chatId = String(message.chat.id);
+  const { api } = deps;
+  const from = message.from;
+  const { addressed, text } = addressedToBot(message);
+  const command = parseCommand(text);
+
+  if (command?.command === "start" && !command.arg) {
+    if (!from) return;
+    const owner = await loadLinkedChat(String(from.id));
+    if (!owner) {
+      await api.sendMessage(chatId, `To use me here, first open a private chat with @${botUsername || "the bot"} and paste your Accred API key. Then send /start in this group again.`);
+      return;
+    }
+    await linkGroup(chatId, { chat: owner.chat, user: owner.user, telegramId: String(from.id) });
+    await api.sendMessage(
+      chatId,
+      `This group now uses ${from.first_name ?? from.username ?? "the member"}'s Accred account. Mention me (@${botUsername}) or reply to me to ask something. Anything that sends, creates or trades waits for ${from.first_name ?? "that member"}'s tap. Budget here: 3 credits per message, 30 per day; change it with /budget.`,
+    );
+    return;
+  }
+  if (!addressed) return;
+  const linked = await loadLinkedChat(chatId);
+  if (!linked) {
+    await api.sendMessage(chatId, `This group is not linked yet. The member whose account it should use sends /start here.`);
+    return;
+  }
+  const isOwner = from && String(from.id) === linked.chat.ownerTelegramId;
+  if (command?.command === "stop") {
+    if (!isOwner) {
+      await api.sendMessage(chatId, "Only the member who linked this group can unlink it.");
+      return;
+    }
+    await unlinkChat(chatId);
+    await api.sendMessage(chatId, "Unlinked. Send /start here to link the group again.");
+    return;
+  }
+  if (!text || looksLikeKey(text) || looksLikePrivateKey(text)) {
+    if (message.message_id !== undefined && (looksLikeKey(text) || looksLikePrivateKey(text))) await api.deleteMessage(chatId, message.message_id);
+    if (text) await api.sendMessage(chatId, "Never paste a key in a group. I deleted it; if it was real, revoke it.");
+    return;
+  }
+  if (rateLimited(`bot:${chatId}`, 20, 60_000)) {
+    await api.sendMessage(chatId, "Slow down a little: at most 20 messages a minute in this group.");
+    return;
+  }
+  if (command) {
+    if (!isOwner && ["key", "budget", "model", "brief", "timezone", "forget", "alert", "alerts", "export"].includes(command.command)) {
+      await api.sendMessage(chatId, "Only the member who linked this group can change its settings or export data.");
+      return;
+    }
+    const handled = await handleCommand(linked.chat, linked.user, command.command, command.arg, api);
+    if (handled) return;
   }
   await chatTurn(chatId, text, deps);
 }

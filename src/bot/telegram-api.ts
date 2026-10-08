@@ -23,6 +23,12 @@ export interface TelegramApi {
   deleteMessage(chatId: string | number, messageId: number): Promise<boolean>;
   answerCallback(callbackId: string, text?: string): Promise<void>;
   typing(chatId: string | number): Promise<void>;
+  /** Sends a small file, such as a CSV, from memory. Returns the message id. */
+  sendDocument(chatId: string | number, file: { name: string; content: string; mimeType?: string }, caption?: string): Promise<number | null>;
+  /** Registers the command menu for one language (undefined for the default). */
+  setMyCommands(commands: Array<{ command: string; description: string }>, languageCode?: string): Promise<void>;
+  /** Makes the chat's menu button open the command list. */
+  setMenuButton(): Promise<void>;
 }
 
 const RETRIES = 3;
@@ -105,6 +111,29 @@ export function telegramApi(token = env.telegramBotToken ?? ""): TelegramApi {
     },
     async typing(chatId) {
       await call(token, "sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => {});
+    },
+    async sendDocument(chatId, file, caption) {
+      const form = new FormData();
+      form.set("chat_id", String(chatId));
+      if (caption) form.set("caption", caption.slice(0, 1000));
+      form.set("document", new Blob([file.content], { type: file.mimeType ?? "text/plain" }), file.name);
+      try {
+        const response = await fetch(`${API}/bot${token}/sendDocument`, { method: "POST", body: form, signal: AbortSignal.timeout(30_000) });
+        const payload = (await response.json()) as { ok: boolean; result?: { message_id: number }; description?: string };
+        if (!payload.ok) throw new Error(payload.description ?? "sendDocument failed");
+        return payload.result?.message_id ?? null;
+      } catch (error) {
+        console.error("[bot] sendDocument failed:", describe(error));
+        return null;
+      }
+    },
+    async setMyCommands(commands, languageCode) {
+      await call(token, "setMyCommands", { commands, ...(languageCode ? { language_code: languageCode } : {}) }).catch((error) =>
+        console.error("[bot] setMyCommands failed:", describe(error)),
+      );
+    },
+    async setMenuButton() {
+      await call(token, "setChatMenuButton", { menu_button: { type: "commands" } }).catch(() => {});
     },
   };
 }

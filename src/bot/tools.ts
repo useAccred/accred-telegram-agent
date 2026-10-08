@@ -6,7 +6,12 @@ import { createRun, executeRun } from "@lib/agent/runner";
 import { ToolError, toolsFor, type ToolContext } from "@lib/agent/tools";
 import { getBalance } from "../balance";
 import { MICRO, formatCredits, toMicro } from "@lib/credits";
-import { auditEvents, automations, db, tradingAutomations, type BotChat, type User } from "@lib/db";
+import { auditEvents, automations, connections, db, positions, riskMandates, tradingAutomations, type BotChat, type User } from "@lib/db";
+import { decrypt } from "@lib/crypto";
+import { audit } from "@lib/trading/audit";
+import { closeMany } from "@lib/trading/controls";
+import { MandateSchema, profileOf, riskIncreases, type Mandate } from "@lib/trading/mandate";
+import { createWatch, describeWatch, listWatches, parseWatch, removeWatch, agentNames, WatchError } from "./watches";
 import { env } from "@lib/env";
 import { monthStart } from "@lib/queries";
 import { describeCron, isValidTimezone, nextRun, validateCron } from "@lib/schedule";
@@ -319,13 +324,26 @@ const tradingResume = control(
   (agent) => resumeAgent(agent, env.liveTrading, "telegram"),
 );
 
-const tradingCloseAll = control(
-  "trading.close_all",
-  "Pause an agent and sell every open position back to USDG at the market price. Needs confirmation.",
-  "Close all positions of",
-  (agent) => `Close all positions of ${agent.automation.name}? The agent is paused first, then every open position is sold at the market price. A position that cannot be priced or sold stays open under its stop loss.`,
-  async (agent) => (await closeAllPositions(agent, "telegram")).text,
-);
+const tradingCloseAll = define({
+  name: "trading.close_all",
+  summary: "Pause an agent and sell every open position back to USDG at the market price. Needs confirmation, then the user must type CLOSE.",
+  argsHint: '{"agent": string (name or id)}',
+  schema: agentArg,
+  effect: "write",
+  async prepare(args, context) {
+    const agent = await findAgent(context.user.id, args.agent);
+    return {
+      title: `Close all positions of ${agent.automation.name}`,
+      description: `Close all positions of ${agent.automation.name}? The agent is paused first, then every open position is sold at the market price. A position that cannot be priced or sold stays open under its stop loss.\n\nAfter Confirm you will be asked to type CLOSE, so a stray tap cannot sell everything.`,
+      args: { agent: agent.automation.id, armWord: "CLOSE" },
+    };
+  },
+  async run(args, context) {
+    const agent = await ownedAgent(context.user.id, String(args.agent));
+    if (!agent) throw new ToolError("That agent no longer exists.");
+    return (await closeAllPositions(agent, "telegram")).text;
+  },
+});
 
 const tradingRevoke = control(
   "trading.revoke_access",
@@ -779,6 +797,7 @@ export const SettingsArgs = z.object({
   modelMode: z.enum(["auto", "economy", "quality", "pinned"]).optional(),
   modelId: z.string().max(200).optional(),
   lowBalanceCredits: z.coerce.number().min(0).max(1_000_000).optional(),
+  briefSections: z.array(z.enum(["balance", "spend", "agents", "automations", "cred"])).max(5).optional(),
 });
 
 export async function applySettings(chat: BotChat, args: z.infer<typeof SettingsArgs>): Promise<string[]> {
@@ -805,6 +824,10 @@ export async function applySettings(chat: BotChat, args: z.infer<typeof Settings
     patch.lowBalanceMicro = toMicro(args.lowBalanceCredits);
     changes.push(`low-balance alert below ${args.lowBalanceCredits} credits`);
   }
+  if (args.briefSections !== undefined) {
+    patch.briefSections = [...new Set(args.briefSections)];
+    changes.push(`brief sections ${args.briefSections.join(", ") || "none"}`);
+  }
   if (args.modelMode !== undefined || args.modelId !== undefined) {
     if (args.modelId || args.modelMode === "pinned") {
       const models = usableTextModels(await listModels().catch(() => []));
@@ -827,13 +850,231 @@ export async function applySettings(chat: BotChat, args: z.infer<typeof Settings
 const botSettings = define({
   name: "bot.settings",
   summary:
-    "Change this chat's settings: the hour of the daily brief (null for none), the timezone, credit limits per message and per day, the model mode or a pinned model id, the low-balance alert threshold.",
-  argsHint: '{"briefHour"?: 0-23|null, "timezone"?: string, "creditsPerMessage"?: number, "creditsPerDay"?: number, "modelMode"?: "auto"|"economy"|"quality", "modelId"?: string, "lowBalanceCredits"?: number}',
+    "Change this chat's settings: the hour of the daily brief (null for none) and its sections, the timezone, credit limits per message and per day, the model mode or a pinned model id, the low-balance alert threshold.",
+  argsHint: '{"briefHour"?: 0-23|null, "timezone"?: string, "creditsPerMessage"?: number, "creditsPerDay"?: number, "modelMode"?: "auto"|"economy"|"quality", "modelId"?: string, "lowBalanceCredits"?: number, "briefSections"?: ("balance"|"spend"|"agents"|"automations"|"cred")[]}',
   schema: SettingsArgs,
   effect: "internal",
   async run(args, context) {
     const changes = await applySettings(context.chat, args);
     return `Settings updated: ${changes.join(", ")}.`;
+  },
+});
+
+// ── Trading: one position, exits, tighter limits (confirmed) ───────────────
+
+async function findOpenPosition(userId: string, agentQuery: string | undefined, symbol: string) {
+  const agent = await findAgent(userId, agentQuery);
+  const open = await listPositions(agent.automation.id, "open", 50);
+  const wanted = symbol.trim().toUpperCase();
+  const position = open.find((candidate) => candidate.symbol.toUpperCase() === wanted) ?? open.find((candidate) => candidate.assetAddress.toLowerCase() === wanted.toLowerCase());
+  if (!position) throw new ToolError(`${agent.automation.name} has no open ${wanted} position. Open: ${open.map((candidate) => candidate.symbol).join(", ") || "none"}.`);
+  return { agent, position };
+}
+
+const tradingClosePosition = define({
+  name: "trading.close_position",
+  summary: "Sell one open position of an agent back to USDG at the market price. Needs confirmation.",
+  argsHint: '{"symbol": string, "agent"?: string}',
+  schema: z.object({ symbol: z.string().min(1).max(60), agent: z.string().max(120).optional() }),
+  effect: "write",
+  async prepare(args, context) {
+    const { agent, position } = await findOpenPosition(context.user.id, args.agent, args.symbol);
+    const pnl = (position.lastPriceUsd - position.entryPriceUsd) * position.quantity;
+    return {
+      title: `Close ${position.symbol} of ${agent.automation.name}`,
+      description: `Sell ${agent.automation.name}'s ${position.symbol} position (${position.quantity.toPrecision(5)} at ${fmtPrice(position.entryPriceUsd)}, now ${fmtPrice(position.lastPriceUsd)}, ${signedUsd(pnl)} before fees) at the market price?`,
+      args: { positionId: position.id, symbol: position.symbol },
+      confirmLabel: `Sell ${position.symbol}`,
+    };
+  },
+  async run(args, context) {
+    const id = String((args as unknown as { positionId: string }).positionId);
+    const [owned] = await db.select({ id: positions.id }).from(positions).where(and(eq(positions.id, id), eq(positions.userId, context.user.id)));
+    if (!owned) throw new ToolError("That position no longer exists.");
+    const result = await closeMany([id], "manual_close");
+    return result.closed ? `Sold ${String((args as unknown as { symbol: string }).symbol)}. The result is in the agent's trades.` : "The position could not be priced or sold right now; it stays open under its stop loss.";
+  },
+});
+
+const tradingSetExit = define({
+  name: "trading.set_exit",
+  summary: "Move an open position's stop loss up or set its take-profit price. A stop can only be tightened (raised); loosening it is refused. Needs confirmation.",
+  argsHint: '{"symbol": string, "agent"?: string, "stopLossPrice"?: number, "takeProfitPrice"?: number}',
+  schema: z.object({ symbol: z.string().min(1).max(60), agent: z.string().max(120).optional(), stopLossPrice: z.coerce.number().positive().optional(), takeProfitPrice: z.coerce.number().positive().optional() }),
+  effect: "write",
+  async prepare(args, context) {
+    if (args.stopLossPrice === undefined && args.takeProfitPrice === undefined) throw new ToolError("Give a stopLossPrice, a takeProfitPrice, or both.");
+    const { agent, position } = await findOpenPosition(context.user.id, args.agent, args.symbol);
+    const changes: string[] = [];
+    if (args.stopLossPrice !== undefined) {
+      if (args.stopLossPrice <= position.stopLossPrice) throw new ToolError(`The stop is ${fmtPrice(position.stopLossPrice)} now. A stop can only be raised from here; lowering it would loosen the agent's protection, which is only possible on the web.`);
+      if (args.stopLossPrice >= position.lastPriceUsd) throw new ToolError(`A stop of ${fmtPrice(args.stopLossPrice)} is at or above the current price ${fmtPrice(position.lastPriceUsd)}; the position would be sold at once. Use trading.close_position for that.`);
+      changes.push(`stop loss ${fmtPrice(position.stopLossPrice)} → ${fmtPrice(args.stopLossPrice)}`);
+    }
+    if (args.takeProfitPrice !== undefined) {
+      if (args.takeProfitPrice <= position.lastPriceUsd) throw new ToolError(`A take-profit of ${fmtPrice(args.takeProfitPrice)} is at or below the current price ${fmtPrice(position.lastPriceUsd)}.`);
+      changes.push(`take profit ${position.takeProfitPrice ? fmtPrice(position.takeProfitPrice) : "none"} → ${fmtPrice(args.takeProfitPrice)}`);
+    }
+    return {
+      title: `Set exits on ${position.symbol} of ${agent.automation.name}`,
+      description: `For ${agent.automation.name}'s ${position.symbol} (now ${fmtPrice(position.lastPriceUsd)}): ${changes.join(", ")}. The monitor sells at these levels on its own.`,
+      args: { positionId: position.id, symbol: position.symbol, agentId: agent.automation.id, stopLossPrice: args.stopLossPrice ?? null, takeProfitPrice: args.takeProfitPrice ?? null, changes },
+    };
+  },
+  async run(args, context) {
+    const input = args as unknown as { positionId: string; symbol: string; agentId: string; stopLossPrice: number | null; takeProfitPrice: number | null; changes: string[] };
+    const [position] = await db.select().from(positions).where(and(eq(positions.id, input.positionId), eq(positions.userId, context.user.id), eq(positions.status, "open")));
+    if (!position) throw new ToolError("That position is no longer open.");
+    if (input.stopLossPrice !== null && input.stopLossPrice <= position.stopLossPrice) throw new ToolError("The stop has moved since; it can only be raised.");
+    await db
+      .update(positions)
+      .set({ ...(input.stopLossPrice !== null ? { stopLossPrice: input.stopLossPrice } : {}), ...(input.takeProfitPrice !== null ? { takeProfitPrice: input.takeProfitPrice } : {}) })
+      .where(eq(positions.id, position.id));
+    await audit({ userId: context.user.id, automationId: input.agentId, positionId: position.id, type: "position_exits_changed", actor: "user", summary: `Exits changed on ${input.symbol}: ${input.changes.join(", ")}` }).catch(() => {});
+    return `Done: ${input.symbol} ${input.changes.join(", ")}.`;
+  },
+});
+
+const TightenArgs = z.object({
+  agent: z.string().max(120).optional(),
+  maxPositionUsd: z.coerce.number().positive().optional(),
+  maxOpenPositions: z.coerce.number().int().min(1).optional(),
+  maxLossPerTradePercent: z.coerce.number().positive().optional(),
+  dailyLossLimitPercent: z.coerce.number().positive().optional(),
+  maxDrawdownPercent: z.coerce.number().positive().optional(),
+  defaultStopLossPercent: z.coerce.number().positive().optional(),
+  maxTotalExposurePercent: z.coerce.number().positive().optional(),
+});
+type TightenKey = Exclude<keyof z.infer<typeof TightenArgs>, "agent">;
+const TIGHTEN_LABEL: Record<TightenKey, string> = {
+  maxPositionUsd: "largest position",
+  maxOpenPositions: "open positions at once",
+  maxLossPerTradePercent: "max loss per trade %",
+  dailyLossLimitPercent: "daily loss limit %",
+  maxDrawdownPercent: "max drawdown %",
+  defaultStopLossPercent: "default stop loss %",
+  maxTotalExposurePercent: "total exposure %",
+};
+
+const tradingTightenLimits = define({
+  name: "trading.tighten_limits",
+  summary:
+    "Make an agent's mandate stricter: a smaller largest position, fewer open positions, a lower daily loss limit, drawdown, loss per trade, exposure, or a tighter default stop. Only tightening is possible here; anything that lets the agent risk more must be done on the web. Needs confirmation.",
+  argsHint: '{"agent"?: string, "maxPositionUsd"?: number, "maxOpenPositions"?: number, "maxLossPerTradePercent"?: number, "dailyLossLimitPercent"?: number, "maxDrawdownPercent"?: number, "defaultStopLossPercent"?: number, "maxTotalExposurePercent"?: number}',
+  schema: TightenArgs,
+  effect: "write",
+  async prepare(args, context) {
+    const agent = await findAgent(context.user.id, args.agent);
+    const before = agent.mandate;
+    const after: Mandate = { ...before };
+    const changes: string[] = [];
+    for (const key of Object.keys(TIGHTEN_LABEL) as TightenKey[]) {
+      const value = args[key];
+      if (value === undefined) continue;
+      if (value === before[key]) continue;
+      (after as Record<string, unknown>)[key] = value;
+      changes.push(`${TIGHTEN_LABEL[key]} ${before[key]} → ${value}`);
+    }
+    if (changes.length === 0) throw new ToolError("Nothing would change.");
+    const parsed = MandateSchema.safeParse(after);
+    if (!parsed.success) throw new ToolError(`That mandate is not valid: ${parsed.error.issues.map((issue) => issue.message).join("; ")}`);
+    const looser = riskIncreases(before, parsed.data);
+    if (looser.length) throw new ToolError(`These changes would let the agent risk more (${looser.join("; ")}). Only tightening is possible here; loosen a mandate at ${WEB}/app/trading/${agent.automation.id}/edit.`);
+    return {
+      title: `Tighten limits of ${agent.automation.name}`,
+      description: `Tighten ${agent.automation.name}'s mandate: ${changes.join("; ")}. Open positions keep their current stops. This becomes mandate version ${agent.automation.mandateVersion + 1}.`,
+      args: { agentId: agent.automation.id, mandate: parsed.data, changes },
+    };
+  },
+  async run(args, context) {
+    const input = args as unknown as { agentId: string; mandate: Mandate; changes: string[] };
+    const agent = await ownedAgent(context.user.id, input.agentId);
+    if (!agent) throw new ToolError("That agent no longer exists.");
+    const mandate = MandateSchema.parse(input.mandate);
+    if (riskIncreases(agent.mandate, mandate).length) throw new ToolError("The mandate changed since; this would now loosen it. Ask again.");
+    const version = agent.automation.mandateVersion + 1;
+    await db.transaction(async (tx) => {
+      await tx.insert(riskMandates).values({ automationId: agent.automation.id, version, profile: profileOf(mandate), mandate });
+      await tx.update(tradingAutomations).set({ mandateVersion: version, updatedAt: new Date() }).where(eq(tradingAutomations.id, agent.automation.id));
+      await audit({ userId: context.user.id, automationId: agent.automation.id, type: "mandate_tightened", actor: "user", summary: `Mandate tightened from Telegram: ${input.changes.join("; ")}`, data: { version } }, tx);
+    });
+    return `Done. ${agent.automation.name} now runs on mandate version ${version}: ${input.changes.join("; ")}.`;
+  },
+});
+
+// ── Gmail (read-only, through the user's Gmail connection) ──────────────────
+
+async function gmailContext(userId: string): Promise<ToolContext> {
+  const [row] = await db.select({ configEnc: connections.configEnc }).from(connections).where(and(eq(connections.userId, userId), eq(connections.kind, "gmail")));
+  if (!row) throw new ToolError(`The user has no Gmail connection. They can connect Gmail (read-only) at ${WEB}/app/connections.`);
+  return { configs: { gmail: JSON.parse(decrypt(row.configEnc)) }, saveMemory: async () => {} };
+}
+
+const gmailTools = toolsFor(["gmail"])
+  .filter((tool) => tool.name.startsWith("gmail."))
+  .map((base) =>
+    define({
+      name: base.name,
+      summary: `${base.summary} Read-only.`,
+      argsHint: base.argsHint,
+      schema: base.schema as z.ZodType,
+      effect: "read",
+      run: async (args, context) => base.run(args as Record<string, unknown>, await gmailContext(context.user.id)),
+    }),
+  );
+
+// ── Alerts ──────────────────────────────────────────────────────────────────
+
+const alertsCreate = define({
+  name: "alerts.create",
+  summary:
+    'Set an alert the bot checks every minute at no credit cost: a price threshold ("ETH below 2000", "CRED above 0.05"; fires once) or a standing event watch ("position closed", "run failed", "agent paused", optionally for one agent).',
+  argsHint: '{"text": string}',
+  schema: z.object({ text: z.string().min(3).max(120) }),
+  effect: "internal",
+  async run(args, context) {
+    const parsed = parseWatch(args.text);
+    if (!parsed) throw new ToolError('I did not understand that alert. Examples: "ETH below 2000", "position closed", "run failed", "agent paused Momentum".');
+    try {
+      const watch = await createWatch(context.chat, context.user, parsed);
+      return `Alert set: ${describeWatch(watch)}. I check it every minute; it costs no credits.`;
+    } catch (error) {
+      throw new ToolError(error instanceof WatchError ? error.message : "The alert could not be set.");
+    }
+  },
+});
+
+const alertsList = define({
+  name: "alerts.list",
+  summary: "The user's alerts, numbered, with their state.",
+  argsHint: "{}",
+  schema: z.object({}),
+  effect: "read",
+  async run(_args, context) {
+    const watches = await listWatches(context.chat.chatId);
+    if (watches.length === 0) return "No alerts set.";
+    const names = await agentNames(context.user.id);
+    return bullet(watches.map((watch, index) => `${index + 1}. ${describeWatch(watch, watch.agentId ? names.get(watch.agentId) : undefined)}`));
+  },
+});
+
+const alertsRemove = define({
+  name: "alerts.remove",
+  summary: "Remove one alert by its number from alerts.list, or all of them.",
+  argsHint: '{"number": number | "all"}',
+  schema: z.object({ number: z.union([z.literal("all"), z.coerce.number().int().min(1)]) }),
+  effect: "internal",
+  async run(args, context) {
+    const watches = await listWatches(context.chat.chatId);
+    if (watches.length === 0) return "There are no alerts to remove.";
+    if (args.number === "all") {
+      for (const watch of watches) await removeWatch(context.chat.chatId, watch.id);
+      return `Removed ${watches.length} alert${watches.length === 1 ? "" : "s"}.`;
+    }
+    const watch = watches[args.number - 1];
+    if (!watch) throw new ToolError(`There is no alert ${args.number}. You have ${watches.length}.`);
+    await removeWatch(context.chat.chatId, watch.id);
+    return `Removed: ${describeWatch(watch)}.`;
   },
 });
 
@@ -858,6 +1099,13 @@ export const BOT_TOOLS: BotToolDef[] = [
   credBuy,
   credSell,
   tradingHistory,
+  tradingClosePosition,
+  tradingSetExit,
+  tradingTightenLimits,
+  ...gmailTools,
+  alertsCreate,
+  alertsList,
+  alertsRemove,
   automationsList,
   automationsCreate,
   automationsRun,

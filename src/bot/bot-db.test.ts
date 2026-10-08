@@ -61,6 +61,12 @@ function fakeApi() {
       },
       async answerCallback() {},
       async typing() {},
+      async sendDocument(chatId: string | number, file: { name: string; content: string }) {
+        sent.push({ chatId: String(chatId), text: `[file ${file.name}]\n${file.content}` });
+        return nextId++;
+      },
+      async setMyCommands() {},
+      async setMenuButton() {},
     },
   };
 }
@@ -257,5 +263,108 @@ describe.skipIf(!url)("telegram agent against the database", () => {
     await send("/stop");
     expect(await app.getChat(chatId)).toBeUndefined();
     expect(sent[sent.length - 1]!.text).toContain("unlinked");
+  });
+  it("links a group to the member's account and answers only when addressed", async () => {
+    const { chatId: privateId, chat: privateChat, api, sent } = await linkedChat();
+    const { setBotIdentity } = await import("./router");
+    setBotIdentity("AccredTestBot");
+    const groupId = newChatId();
+    const member: { id: number; first_name: string; username?: string } = { id: Number(privateId), first_name: "Asha", username: "asha" };
+    const stranger: typeof member = { id: Number(privateId) + 1, first_name: "Vik" };
+    const group = { id: Number(groupId), type: "supergroup", title: "Ops" };
+    sent.length = 0;
+    const send = (text: string, from = member, replies: string[] = []) => app.handleBotUpdate({ update_id: 20, message: { message_id: 20, text, chat: group, from } }, deps(replies, api));
+
+    await send("/start", stranger);
+    expect(sent[sent.length - 1]!.text).toContain("first open a private chat");
+    expect(await app.getChat(groupId)).toBeUndefined();
+
+    await send("/start");
+    const chat = (await app.getChat(groupId))!;
+    expect(chat.chatKind).toBe("group");
+    expect(chat.userId).toBe(privateChat.userId);
+    expect(chat.ownerTelegramId).toBe(privateId);
+    expect(chat.maxPerMessageMicro).toBe(3_000_000n);
+    expect(sent[sent.length - 1]!.text).toContain("now uses Asha's Accred account");
+
+    const before = sent.length;
+    await send("lunch anyone?", stranger, ['{"final": "never"}']);
+    expect(sent).toHaveLength(before);
+    await send("@AccredTestBot what is my balance?", stranger, ['{"thought": "answer", "final": "1,200.50 credits."}']);
+    expect(sent[sent.length - 1]!.text).toBe("1,200.50 credits.");
+
+    // A write tool asked for in the group waits for the owner's tap; a stranger's tap is refused.
+    const call = JSON.stringify({ tool: "trading.create_wallet", args: { name: "Team" } });
+    await send("@AccredTestBot make a wallet", member, [call]);
+    const [action] = await app.pendingActions(groupId);
+    expect(action?.tool).toBe("trading.create_wallet");
+    await app.handleBotUpdate({ update_id: 21, callback_query: { id: "cb", data: `a:${action!.id}:y`, from: stranger, message: { message_id: 1, chat: group } } }, deps([], api));
+    expect((await app.pendingActions(groupId))).toHaveLength(1);
+    await app.handleBotUpdate({ update_id: 22, callback_query: { id: "cb", data: `a:${action!.id}:n`, from: member, message: { message_id: 1, chat: group } } }, deps([], api));
+    expect((await app.pendingActions(groupId))).toHaveLength(0);
+    expect(sent[sent.length - 1]!.text).toContain("Cancelled");
+  });
+
+  it("event alerts fire from the heartbeat without a model call, and can be removed", async () => {
+    const { chatId, chat, api, sent } = await linkedChat();
+    sent.length = 0;
+    const send = (text: string) => app.handleBotUpdate({ update_id: 30, message: { message_id: 30, text, chat: { id: Number(chatId), type: "private" } } }, deps([], api));
+    await send("/alert run failed");
+    expect(sent[sent.length - 1]!.text).toContain("Alert set: an automation run fails");
+    const now = Date.now() + 30 * 60_000;
+    await app.botHeartbeat(api, now);
+    const [automation] = await app.db
+      .insert(app.automations)
+      .values({ userId: chat.userId!, name: "Digest", instruction: "Read things.", triggerType: "manual", webhookToken: `t2-${chatId}`, maxPerRunMicro: 1_000_000n, maxPerMonthMicro: 10_000_000n })
+      .returning({ id: app.automations.id });
+    await app.db.insert(app.runs).values({ automationId: automation!.id, userId: chat.userId!, trigger: "manual", status: "failed", budgetMicro: 1_000_000n, error: "The feed timed out.", finishedAt: new Date(now + 60_000) });
+    sent.length = 0;
+    await app.botHeartbeat(api, now + 2 * 60_000);
+    expect(sent.map((message) => message.text)).toEqual([expect.stringContaining('Automation "Digest" failed')]);
+    expect(sent[0]!.text).toContain("The feed timed out.");
+    // Already reported: a later tick stays quiet.
+    await app.botHeartbeat(api, now + 4 * 60_000);
+    expect(sent).toHaveLength(1);
+
+    await send("/alert");
+    expect(sent[sent.length - 1]!.text).toContain("1. an automation run fails");
+    expect(sent[sent.length - 1]!.buttons?.[0]?.[0]?.callback_data).toMatch(/^w:off:/);
+    await send("/alert off 1");
+    expect(sent[sent.length - 1]!.text).toContain("Removed");
+    await send("/alert");
+    expect(sent[sent.length - 1]!.text).toContain("No alerts yet");
+  });
+
+  it("menus carry the choice in the button, and /history and /export answer from the database", async () => {
+    const { chatId, chat, api, sent } = await linkedChat();
+    sent.length = 0;
+    const send = (text: string) => app.handleBotUpdate({ update_id: 40, message: { message_id: 40, text, chat: { id: Number(chatId), type: "private" } } }, deps([], api));
+    const tap = (data: string) => app.handleBotUpdate({ update_id: 41, callback_query: { id: "cb", data, message: { message_id: 2, chat: { id: Number(chatId), type: "private" } } } }, deps([], api));
+    await send("/model");
+    expect(sent[sent.length - 1]!.buttons?.[0]?.map((button) => button.callback_data)).toEqual(["s:model:auto", "s:model:economy", "s:model:quality"]);
+    await tap("s:model:economy");
+    expect((await app.getChat(chatId))!.modelMode).toBe("economy");
+    await send("/budget");
+    await tap("s:budget:10:300");
+    expect((await app.getChat(chatId))!.maxPerMessageMicro).toBe(10_000_000n);
+    await send("/brief");
+    await tap("s:bsec:agents");
+    expect((await app.getChat(chatId))!.briefSections).toEqual(["balance", "spend", "automations"]);
+    await send("/brief sections balance,cred");
+    expect((await app.getChat(chatId))!.briefSections).toEqual(["balance", "cred"]);
+
+    await app.db.insert(app.botTurns).values({ chatId, userId: chat.userId!, creditsMicro: 2_500_000n, outcome: "answered" });
+    await send("/history");
+    expect(sent[sent.length - 1]!.text).toContain("Credits spent in the last 14 days: 2.50");
+    await send("/export runs");
+    expect(sent[sent.length - 1]!.text).toContain("No runs in the last 90 days");
+    const [automation] = await app.db
+      .insert(app.automations)
+      .values({ userId: chat.userId!, name: "Digest", instruction: "Read things.", triggerType: "manual", webhookToken: `t3-${chatId}`, maxPerRunMicro: 1_000_000n, maxPerMonthMicro: 10_000_000n })
+      .returning({ id: app.automations.id });
+    await app.db.insert(app.runs).values({ automationId: automation!.id, userId: chat.userId!, trigger: "manual", status: "succeeded", budgetMicro: 1_000_000n, creditsMicro: 120_000n });
+    await send("/export runs");
+    expect(sent[sent.length - 1]!.text).toContain("[file accred-runs-");
+    expect(sent[sent.length - 1]!.text).toContain("Digest,manual,succeeded,0.12");
   });
 });

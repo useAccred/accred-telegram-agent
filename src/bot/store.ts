@@ -1,5 +1,6 @@
 import { and, count, desc, eq, gte, inArray, lt, sum } from "drizzle-orm";
 import { botActions, botChats, botTurns, connections, db, runs, tradingRuns, users, type BotAction, type BotChat, type User } from "@lib/db";
+import { localDate } from "./format";
 import { dayStart } from "@lib/trading/portfolio";
 
 /** Database access for the Telegram agent: chats, turns and pending actions. */
@@ -40,6 +41,79 @@ export async function linkChat(chatId: string, userId: string): Promise<void> {
     .insert(botChats)
     .values({ chatId, userId, state: "linked", lastMessageAt: new Date(), maxPerMessageMicro: DEFAULT_PER_MESSAGE_MICRO, maxPerDayMicro: DEFAULT_PER_DAY_MICRO })
     .onConflictDoUpdate({ target: botChats.chatId, set: { userId, state: "linked", transcript: [], updatedAt: new Date() } });
+}
+
+/** Group defaults: a shared chat spends the owner's credits, so it starts tight. */
+export const GROUP_PER_MESSAGE_MICRO = 3_000_000n;
+export const GROUP_PER_DAY_MICRO = 30_000_000n;
+
+/** Links a group to the account of the member who ran /start there. Their private chat's settings carry over. */
+export async function linkGroup(groupId: string, owner: { chat: BotChat; user: User; telegramId: string }): Promise<void> {
+  await db
+    .insert(botChats)
+    .values({
+      chatId: groupId,
+      userId: owner.user.id,
+      state: "linked",
+      chatKind: "group",
+      ownerTelegramId: owner.telegramId,
+      timezone: owner.chat.timezone,
+      modelMode: owner.chat.modelMode,
+      modelId: owner.chat.modelId,
+      maxPerMessageMicro: GROUP_PER_MESSAGE_MICRO,
+      maxPerDayMicro: GROUP_PER_DAY_MICRO,
+      briefHour: null,
+      lowBalanceMicro: 0n,
+      lastMessageAt: new Date(),
+    })
+    .onConflictDoUpdate({
+      target: botChats.chatId,
+      set: { userId: owner.user.id, state: "linked", chatKind: "group", ownerTelegramId: owner.telegramId, transcript: [], updatedAt: new Date() },
+    });
+}
+
+/** The pending close-all action that the user has confirmed and must now arm with the typed word. */
+export async function armedAction(chatId: string): Promise<BotAction | undefined> {
+  const rows = await pendingActions(chatId);
+  return rows.find((action) => action.kind === "tool" && action.args.armed === true);
+}
+
+export async function armAction(id: string): Promise<void> {
+  const [action] = await db.select().from(botActions).where(eq(botActions.id, id));
+  if (!action) return;
+  await db.update(botActions).set({ args: { ...action.args, armed: true }, expiresAt: new Date(Date.now() + 2 * 60_000) }).where(eq(botActions.id, id));
+}
+
+export interface DaySpend {
+  date: string;
+  chat: bigint;
+  automations: bigint;
+  trading: bigint;
+  total: bigint;
+}
+
+/** Credits spent per local day over the last `days` days, newest first. */
+export async function spendByDay(userId: string, timezone: string, days = 14, now = Date.now()): Promise<DaySpend[]> {
+  const since = new Date(now - days * 86_400_000);
+  const [chat, auto, trade] = await Promise.all([
+    db.select({ at: botTurns.createdAt, micro: botTurns.creditsMicro }).from(botTurns).where(and(eq(botTurns.userId, userId), gte(botTurns.createdAt, since))),
+    db.select({ at: runs.createdAt, micro: runs.creditsMicro }).from(runs).where(and(eq(runs.userId, userId), gte(runs.createdAt, since))),
+    db.select({ at: tradingRuns.createdAt, micro: tradingRuns.creditsMicro }).from(tradingRuns).where(and(eq(tradingRuns.userId, userId), gte(tradingRuns.createdAt, since))),
+  ]);
+  const byDay = new Map<string, DaySpend>();
+  const add = (rows: Array<{ at: Date; micro: bigint }>, key: "chat" | "automations" | "trading") => {
+    for (const row of rows) {
+      const date = localDate(row.at.getTime(), timezone);
+      const day = byDay.get(date) ?? { date, chat: 0n, automations: 0n, trading: 0n, total: 0n };
+      day[key] += row.micro;
+      day.total += row.micro;
+      byDay.set(date, day);
+    }
+  };
+  add(chat, "chat");
+  add(auto, "automations");
+  add(trade, "trading");
+  return [...byDay.values()].sort((a, b) => (a.date < b.date ? 1 : -1));
 }
 
 export async function unlinkChat(chatId: string): Promise<void> {

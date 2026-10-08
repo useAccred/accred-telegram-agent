@@ -2,7 +2,9 @@ import { createServer } from "node:http";
 import { env } from "@lib/env";
 import { getBotUsername } from "@lib/telegram";
 import { botHeartbeat } from "./bot/heartbeat";
-import { handleBotUpdate } from "./bot/router";
+import { registerMenu } from "./bot/menu";
+import { handleBotUpdate, setBotIdentity } from "./bot/router";
+import { telegramApi } from "./bot/telegram-api";
 import { pollingHealth, startPolling } from "./polling";
 
 /**
@@ -50,7 +52,11 @@ function main(): void {
   const token = env.telegramBotToken;
   getBotUsername()
     .catch(() => "AccredAgentbot")
-    .then((name) => startPolling(token, handleBotUpdate, name));
+    .then((name) => {
+      setBotIdentity(name);
+      startPolling(token, handleBotUpdate, name);
+      void registerMenu(telegramApi(token)).then(() => console.log("[bot] Command menu registered"));
+    });
   // Watchdog: a quiet connection to Telegram is not a working bot. Exit, and the host restarts the process.
   setInterval(() => {
     const polling = pollingHealth();

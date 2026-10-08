@@ -7,7 +7,9 @@ import { listTradingAgents, listWallets } from "@lib/trading/queries";
 import { walletBalances } from "@lib/trading/wallets";
 import { credBalance } from "./cred";
 import { dayStart } from "@lib/trading/portfolio";
-import { requestRunApproval } from "./actions";
+import { briefDetailButtons, requestRunApproval } from "./actions";
+import { credMarket } from "./cred";
+import { checkWatches } from "./watches";
 import { bullet, credits, isoWeek, localDate, localDay, localHour } from "./format";
 import { creditsBetween, expireActions, listLinkedChats, updateChat } from "./store";
 import { telegramApi, type TelegramApi } from "./telegram-api";
@@ -39,6 +41,7 @@ export async function botHeartbeat(api: TelegramApi = telegramApi(), now = Date.
       await sendWeekly(chat, user, api, now);
       await checkBalance(chat, user, api, now);
       await watchDeposits(chat, user, api, now);
+      await sendWatches(chat, user, api, now);
     } catch (error) {
       console.error(`[bot heartbeat ${chat.chatId}]`, error instanceof Error ? error.message : error);
     }
@@ -91,18 +94,28 @@ export async function briefText(chat: BotChat, user: User, now = Date.now()): Pr
       .where(and(eq(tradingAutomations.userId, user.id), eq(tradingAutomations.status, "paused"), eq(tradingAutomations.pausedBy, "breaker"))),
   ]);
   const total = spent.automations + spent.trading + spent.chat;
-  const lines = [
-    `Good morning.${balance ? ` Balance ${credits(balance.micro)}.` : ""}`,
-    total > 0n
-      ? `Yesterday you spent ${formatCredits(total)} credits: ${formatCredits(spent.automations)} on ${spent.runs} automation runs, ${formatCredits(spent.trading)} on ${spent.cycles} trading cycles, ${formatCredits(spent.chat)} here.`
-      : "Nothing was spent yesterday.",
-  ];
-  if (agents.length) lines.push("", "Trading agents:", bullet(agents));
-  if (paused.length) lines.push("", "Auto-paused and waiting for you:", bullet(paused.map((agent) => `${agent.name}: ${agent.reason ?? "a safety limit was reached"}`)));
-  if (runRows.length) {
+  const wants = (section: BotChat["briefSections"][number]) => chat.briefSections.includes(section);
+  const lines = [`Good morning.${wants("balance") && balance ? ` Balance ${credits(balance.micro)}.` : ""}`];
+  if (wants("spend")) {
+    lines.push(
+      total > 0n
+        ? `Yesterday you spent ${formatCredits(total)} credits: ${formatCredits(spent.automations)} on ${spent.runs} automation runs, ${formatCredits(spent.trading)} on ${spent.cycles} trading cycles, ${formatCredits(spent.chat)} here.`
+        : "Nothing was spent yesterday.",
+    );
+  }
+  if (wants("agents")) {
+    // One line per agent keeps the brief short; the Details button has the rest.
+    if (agents.length) lines.push("", "Trading agents:", bullet(agents.map((line) => line.split(" · ").slice(0, 3).join(" · "))));
+    if (paused.length) lines.push("", "Auto-paused and waiting for you:", bullet(paused.map((agent) => `${agent.name}: ${agent.reason ?? "a safety limit was reached"}`)));
+  }
+  if (wants("automations") && runRows.length) {
     const failed = runRows.filter((run) => run.status === "failed" || run.status === "stopped_budget");
     const waiting = runRows.filter((run) => run.status === "waiting_approval");
     lines.push("", `Automations since yesterday: ${runRows.length} runs, ${runRows.filter((run) => run.status === "succeeded").length} succeeded${failed.length ? `, ${failed.length} failed (${[...new Set(failed.map((run) => run.name))].join(", ")})` : ""}${waiting.length ? `, ${waiting.length} waiting for your approval` : ""}.`);
+  }
+  if (wants("cred")) {
+    const market = await credMarket().catch(() => null);
+    if (market) lines.push("", market.text.split("\n")[0]!);
   }
   lines.push("", "Reply to ask me anything.");
   return lines.join("\n");
@@ -114,7 +127,7 @@ async function sendBrief(chat: BotChat, user: User, api: TelegramApi, now: numbe
   if (chat.lastBriefOn === today || localHour(now, chat.timezone) !== chat.briefHour) return;
   // Claim the day first, so a slow brief is never sent twice.
   await updateChat(chat.chatId, { lastBriefOn: today });
-  await api.sendMessage(chat.chatId, await briefText(chat, user, now));
+  await api.sendMessage(chat.chatId, await briefText(chat, user, now), { buttons: briefDetailButtons });
 }
 
 async function checkBalance(chat: BotChat, user: User, api: TelegramApi, now: number): Promise<void> {
@@ -210,5 +223,14 @@ async function sendWeekly(chat: BotChat, user: User, api: TelegramApi, now: numb
   const week = isoWeek(localDate(now, chat.timezone));
   if (chat.lastWeeklyOn === week) return;
   await updateChat(chat.chatId, { lastWeeklyOn: week });
-  await api.sendMessage(chat.chatId, await weeklyText(chat, user, now));
+  await api.sendMessage(chat.chatId, await weeklyText(chat, user, now), { buttons: [[{ text: "Agent details", callback_data: "b:agents" }]] });
+}
+
+// ── Alerts the user defined ─────────────────────────────────────────────────
+
+/** Price thresholds and event watches. Each chat is checked once a minute; the watermark moves whatever happens. */
+async function sendWatches(chat: BotChat, user: User, api: TelegramApi, now: number): Promise<void> {
+  const notices = await checkWatches(chat, user);
+  await updateChat(chat.chatId, { lastWatchAt: new Date(now) });
+  if (notices.length) await api.sendMessage(chat.chatId, notices.join("\n\n"));
 }
