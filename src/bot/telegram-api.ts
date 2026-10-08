@@ -25,16 +25,47 @@ export interface TelegramApi {
   typing(chatId: string | number): Promise<void>;
 }
 
+const RETRIES = 3;
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Why a fetch failed, with the cause Node hides inside "fetch failed". */
+function describe(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const cause = (error as { cause?: { code?: string; message?: string } }).cause;
+  return cause ? `${error.message} (${cause.code ?? ""} ${cause.message ?? ""})`.trim() : error.message;
+}
+
+/**
+ * Calls one Bot API method. A network failure is retried a few times with a
+ * short pause: the instance's connection to Telegram drops now and then, and a
+ * reply must not be lost to one dropped connection.
+ */
 async function call<T>(token: string, method: string, body: Record<string, unknown>): Promise<T> {
-  const response = await fetch(`${API}/bot${token}/${method}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(15_000),
-  });
-  const payload = (await response.json()) as { ok: boolean; result?: T; description?: string };
-  if (!payload.ok) throw Object.assign(new Error(payload.description ?? `Telegram ${method} failed`), { status: response.status });
-  return payload.result as T;
+  let last: unknown;
+  for (let attempt = 1; attempt <= RETRIES; attempt++) {
+    try {
+      const response = await fetch(`${API}/bot${token}/${method}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(20_000),
+      });
+      const payload = (await response.json()) as { ok: boolean; result?: T; description?: string; parameters?: { retry_after?: number } };
+      if (payload.ok) return payload.result as T;
+      // Telegram's own refusals are final, except a rate limit, which says how long to wait.
+      if (response.status === 429 && payload.parameters?.retry_after && attempt < RETRIES) {
+        await sleep(Math.min(payload.parameters.retry_after, 10) * 1000);
+        continue;
+      }
+      throw Object.assign(new Error(payload.description ?? `Telegram ${method} failed`), { status: response.status, final: true });
+    } catch (error) {
+      if ((error as { final?: boolean }).final) throw error;
+      last = error;
+      console.error(`[bot] ${method} attempt ${attempt} failed: ${describe(error)}`);
+      if (attempt < RETRIES) await sleep(1_000 * attempt);
+    }
+  }
+  throw last instanceof Error ? last : new Error(String(last));
 }
 
 export function telegramApi(token = env.telegramBotToken ?? ""): TelegramApi {
@@ -53,7 +84,7 @@ export function telegramApi(token = env.telegramBotToken ?? ""): TelegramApi {
           });
           last = result.message_id;
         } catch (error) {
-          console.error("[bot] sendMessage failed", error instanceof Error ? error.message : error);
+          console.error("[bot] sendMessage gave up:", describe(error));
           return null;
         }
       }
