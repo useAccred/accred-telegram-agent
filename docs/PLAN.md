@@ -154,6 +154,8 @@ The protocol, parser, router, worst-case pricing and compaction are the ones the
 | `trading.create_agent` | **write** | Create and start a trading agent from a profile, an allocation and an asset list |
 | `cred.market` | read | The live market of $CRED: price, market cap and fully diluted value, burned supply read from the chain, liquidity, volume, changes |
 | `cred.buy` | **write** | Buy CRED with USDG from the user's trading wallet: quoted and simulated through the same route and pinned router as trading agents, sent only after the tap |
+| `cred.sell` | **write** | Sell CRED back to USDG from the trading wallet, quoted and simulated the same way |
+| `trading.history` | read | The audit log in plain sentences: what agents and wallets did, for one agent or all, over the last days |
 | `automations.list` | read | The user's automations, their schedule and last run |
 | `automations.create` | **write** | Create an automation: instruction, schedule, connections |
 | `automations.run` | **write** | Run an automation now |
@@ -196,10 +198,14 @@ The scheduler already ticks every 30 seconds. The bot adds a heartbeat on the sa
 1. **Sends approval requests.** Any run waiting for approval that the chat has not been told about.
 2. **Sends the daily brief** at the chat's brief hour in its timezone, once per day: balance, yesterday's spend by product, every trading agent's state and result, automation runs of the day, and anything auto-paused.
 3. **Warns on low balance** once per 24 hours when the balance is below the chat's threshold (default 200 credits).
+4. **Announces deposits.** Every two minutes it reads each trading wallet's USDG, ETH and CRED; an increase is reported once, with the wallet's new balances.
+5. **Sends a weekly report** on Monday at the brief hour: per agent, closed trades, net result after fees, win rate, best and worst trade, equity; and credits spent by product.
 
 Trade executions, rejections, exits, breakers and failures reach the chat through the existing notification path, because the chat is a Telegram connection and the bot links it to every agent it creates.
 
 Nothing in the heartbeat calls a model. It costs no credits.
+
+The process also watches itself: the polling loop records when Telegram last answered, the health endpoint reports it (503 when stale), and after five quiet minutes the process exits so the host restarts it.
 
 ---
 

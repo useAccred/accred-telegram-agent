@@ -1,10 +1,14 @@
 import { and, desc, eq, gte, notInArray, sql } from "drizzle-orm";
 import { getBalance } from "../balance";
 import { formatCredits } from "@lib/credits";
-import { automations, db, runSteps, runs, tradingAutomations, type BotChat, type User } from "@lib/db";
+import { automations, db, positions, runSteps, runs, tradingAutomations, type BotChat, type User } from "@lib/db";
+import { fmtUsd, signedUsd } from "@lib/trading/format";
+import { listTradingAgents, listWallets } from "@lib/trading/queries";
+import { walletBalances } from "@lib/trading/wallets";
+import { credBalance } from "./cred";
 import { dayStart } from "@lib/trading/portfolio";
 import { requestRunApproval } from "./actions";
-import { bullet, credits, localDate, localHour } from "./format";
+import { bullet, credits, isoWeek, localDate, localDay, localHour } from "./format";
 import { creditsBetween, expireActions, listLinkedChats, updateChat } from "./store";
 import { telegramApi, type TelegramApi } from "./telegram-api";
 import { agentLines } from "./tools";
@@ -19,6 +23,8 @@ const BALANCE_CHECK_MS = 30 * 60_000;
 const ALERT_AGAIN_MS = 24 * 3_600_000;
 let lastRun = 0;
 const balanceChecked = new Map<string, number>();
+const DEPOSIT_CHECK_MS = 2 * 60_000;
+const depositChecked = new Map<string, number>();
 
 export async function botHeartbeat(api: TelegramApi = telegramApi(), now = Date.now()): Promise<void> {
   if (now - lastRun < EVERY_MS) return;
@@ -30,7 +36,9 @@ export async function botHeartbeat(api: TelegramApi = telegramApi(), now = Date.
     try {
       await sendApprovals(chat, user, api);
       await sendBrief(chat, user, api, now);
+      await sendWeekly(chat, user, api, now);
       await checkBalance(chat, user, api, now);
+      await watchDeposits(chat, user, api, now);
     } catch (error) {
       console.error(`[bot heartbeat ${chat.chatId}]`, error instanceof Error ? error.message : error);
     }
@@ -123,3 +131,84 @@ async function checkBalance(chat: BotChat, user: User, api: TelegramApi, now: nu
   );
 }
 
+
+// ── Deposits ────────────────────────────────────────────────────────────────
+
+export type Held = { usdg: number; eth: number; cred: number; at: number };
+
+/** The increases worth telling the user about, in words. Small movements and decreases are ignored. */
+export function depositChanges(before: Held | undefined, after: Held): string[] {
+  if (!before) return [];
+  const lines: string[] = [];
+  // A hair of tolerance, so 0.0012 − 0.001 counts as the 0.0002 it is.
+  const grew = (from: number, to: number, min: number) => to - from >= min - 1e-9;
+  if (grew(before.usdg, after.usdg, 0.5)) lines.push(`+${(after.usdg - before.usdg).toFixed(2)} USDG`);
+  if (grew(before.eth, after.eth, 0.0002)) lines.push(`+${(after.eth - before.eth).toFixed(5)} ETH`);
+  if (grew(before.cred, after.cred, 1)) lines.push(`+${(after.cred - before.cred).toLocaleString("en-US", { maximumFractionDigits: 0 })} CRED`);
+  return lines;
+}
+
+/** Announces arrivals in the user's trading wallets. The first reading of a wallet is only remembered. */
+async function watchDeposits(chat: BotChat, user: User, api: TelegramApi, now: number): Promise<void> {
+  if (now - (depositChecked.get(chat.chatId) ?? 0) < DEPOSIT_CHECK_MS) return;
+  depositChecked.set(chat.chatId, now);
+  const wallets = await listWallets(user.id);
+  if (wallets.length === 0) return;
+  const seen = { ...chat.walletBalances };
+  const notices: string[] = [];
+  for (const wallet of wallets) {
+    const [balances, cred] = await Promise.all([walletBalances(wallet.address, { maxAgeMs: 0 }).catch(() => null), credBalance(wallet.address).catch(() => null)]);
+    if (!balances || cred === null) continue;
+    const held: Held = { usdg: balances.usdg, eth: balances.eth, cred, at: now };
+    const changes = depositChanges(seen[wallet.address], held);
+    if (changes.length) {
+      notices.push(`${changes.join(", ")} arrived in ${wallet.name} (${wallet.address}). It now holds ${held.usdg.toFixed(2)} USDG, ${held.eth.toFixed(5)} ETH and ${held.cred.toLocaleString("en-US", { maximumFractionDigits: 0 })} CRED.`);
+    }
+    seen[wallet.address] = held;
+  }
+  await updateChat(chat.chatId, { walletBalances: seen });
+  if (notices.length) await api.sendMessage(chat.chatId, `${notices.join("\n\n")}\n\nSay "set up a trading agent" or "buy CRED" whenever you are ready.`);
+}
+
+// ── Weekly report ───────────────────────────────────────────────────────────
+
+export async function weeklyText(chat: BotChat, user: User, now = Date.now()): Promise<string> {
+  const since = new Date(now - 7 * 86_400_000);
+  const [agents, closed, spent] = await Promise.all([
+    listTradingAgents(user.id).catch(() => []),
+    db
+      .select({ automationId: positions.automationId, symbol: positions.symbol, realizedPnlUsd: positions.realizedPnlUsd, feesUsd: positions.feesUsd, closeReason: positions.closeReason })
+      .from(positions)
+      .where(and(eq(positions.userId, user.id), eq(positions.status, "closed"), gte(positions.closedAt, since))),
+    creditsBetween(user.id, since, new Date(now)),
+  ]);
+  const lines = [`Your week with Accred (${localDate(since.getTime(), chat.timezone)} to ${localDate(now, chat.timezone)}):`];
+  if (agents.length === 0) lines.push("No trading agents yet.");
+  for (const { automation, portfolio } of agents) {
+    const mine = closed.filter((position) => position.automationId === automation.id);
+    const results = mine.map((position) => position.realizedPnlUsd - position.feesUsd);
+    const net = results.reduce((total, value) => total + value, 0);
+    const wins = results.filter((value) => value > 0).length;
+    const best = mine.length ? mine.reduce((a, b) => (a.realizedPnlUsd - a.feesUsd >= b.realizedPnlUsd - b.feesUsd ? a : b)) : null;
+    const worst = mine.length ? mine.reduce((a, b) => (a.realizedPnlUsd - a.feesUsd <= b.realizedPnlUsd - b.feesUsd ? a : b)) : null;
+    lines.push(
+      "",
+      `${automation.name} (${automation.status}): ${mine.length} closed trade${mine.length === 1 ? "" : "s"}, net ${signedUsd(net)} after fees${mine.length ? `, win rate ${Math.round((wins / mine.length) * 100)}%` : ""}.` +
+        (best && worst && mine.length > 1 ? ` Best ${best.symbol} ${signedUsd(best.realizedPnlUsd - best.feesUsd)}, worst ${worst.symbol} ${signedUsd(worst.realizedPnlUsd - worst.feesUsd)}.` : "") +
+        ` Equity now ${fmtUsd(portfolio.equityUsd)} of ${fmtUsd(portfolio.allocationUsd)}, ${portfolio.openPositions} open.`,
+    );
+  }
+  const total = spent.automations + spent.trading + spent.chat;
+  lines.push("", `Credits this week: ${formatCredits(total)} (${formatCredits(spent.trading)} on ${spent.cycles} trading cycles, ${formatCredits(spent.automations)} on ${spent.runs} automation runs, ${formatCredits(spent.chat)} here).`, "", "Ask me for any agent's details, or say what to change.");
+  return lines.join("\n");
+}
+
+/** Monday at the brief hour (09:00 when no brief is set), once a week. */
+async function sendWeekly(chat: BotChat, user: User, api: TelegramApi, now: number): Promise<void> {
+  const hour = chat.briefHour ?? 9;
+  if (localDay(now, chat.timezone) !== 1 || localHour(now, chat.timezone) !== hour) return;
+  const week = isoWeek(localDate(now, chat.timezone));
+  if (chat.lastWeeklyOn === week) return;
+  await updateChat(chat.chatId, { lastWeeklyOn: week });
+  await api.sendMessage(chat.chatId, await weeklyText(chat, user, now));
+}

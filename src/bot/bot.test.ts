@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { actionButtons } from "./actions";
 import { buildBotSystemPrompt } from "./agent";
-import { localDate, localHour, looksLikeKey, looksLikePrivateKey, parseCommand, splitMessage } from "./format";
+import { isoWeek, localDate, localDay, localHour, looksLikeKey, looksLikePrivateKey, parseCommand, splitMessage } from "./format";
+import { depositChanges } from "./heartbeat";
 import { trimTranscript } from "./store";
 import { BOT_TOOLS } from "./tools";
 import { assetsBlockedBy, buildMandate, describeMandate } from "@lib/trading/create";
@@ -193,6 +194,7 @@ describe("$CRED market", () => {
       venue: () => {
         throw new Error("not needed");
       },
+      balance: async () => 0,
       now: () => 1_003_000,
     });
     expect(market.marketCapUsd).toBeCloseTo(1_960_000, 0);
@@ -209,10 +211,29 @@ describe("$CRED market", () => {
       snapshot: async () => undefined,
       supply: async () => ({ total: 1, burned: 0, net: 1 }),
       venue: () => ({ funds: async () => ({ usdg: 5, usdgRaw: 5_000_000n, ethWei: 10n ** 18n }) }) as never,
+      balance: async () => 0,
       now: () => 0,
     };
     await expect(quoteCredBuy({ walletAddress: "0x" + "11".repeat(20), usdg: 50, slippagePercent: 1 }, deps)).rejects.toThrow("holds 5.00 USDG");
     await expect(quoteCredBuy({ walletAddress: "0x" + "11".repeat(20), usdg: 0.5, slippagePercent: 1 }, deps)).rejects.toThrow("at least 1 USDG");
     await expect(quoteCredBuy({ walletAddress: "0x" + "11".repeat(20), usdg: 2, slippagePercent: 9 }, deps)).rejects.toThrow("Slippage");
+  });
+});
+
+describe("weeks and deposits", () => {
+  it("knows the ISO week and the weekday", () => {
+    expect(isoWeek("2026-10-08")).toBe("2026-W41");
+    expect(isoWeek("2026-01-01")).toBe("2026-W01");
+    expect(isoWeek("2027-01-01")).toBe("2026-W53");
+    expect(localDay(Date.UTC(2026, 9, 8, 12), "UTC")).toBe(4);
+    expect(localDay(Date.UTC(2026, 9, 11, 23), "Asia/Kolkata")).toBe(1);
+  });
+
+  it("reports only meaningful increases, never the first reading or a decrease", () => {
+    const before = { usdg: 10, eth: 0.001, cred: 0, at: 0 };
+    expect(depositChanges(undefined, { usdg: 500, eth: 1, cred: 1000, at: 1 })).toEqual([]);
+    expect(depositChanges(before, { usdg: 10.2, eth: 0.001, cred: 0, at: 1 })).toEqual([]);
+    expect(depositChanges(before, { usdg: 60, eth: 0.0012, cred: 250_000, at: 1 })).toEqual(["+50.00 USDG", "+0.00020 ETH", "+250,000 CRED"]);
+    expect(depositChanges(before, { usdg: 2, eth: 0, cred: 0, at: 1 })).toEqual([]);
   });
 });

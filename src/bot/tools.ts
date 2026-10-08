@@ -1,4 +1,4 @@
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, gte } from "drizzle-orm";
 import { z } from "zod";
 import { listModels } from "@lib/accred";
 import { displayName, featuredModels, pickRouting, usableTextModels } from "@lib/agent/router";
@@ -6,7 +6,7 @@ import { createRun, executeRun } from "@lib/agent/runner";
 import { ToolError, toolsFor, type ToolContext } from "@lib/agent/tools";
 import { getBalance } from "../balance";
 import { MICRO, formatCredits, toMicro } from "@lib/credits";
-import { automations, db, tradingAutomations, type BotChat, type User } from "@lib/db";
+import { auditEvents, automations, db, tradingAutomations, type BotChat, type User } from "@lib/db";
 import { env } from "@lib/env";
 import { monthStart } from "@lib/queries";
 import { describeCron, isValidTimezone, nextRun, validateCron } from "@lib/schedule";
@@ -20,7 +20,7 @@ import { agentDashboard, listDecisions, listPositions, listTradingAgents, listTr
 import { loadAgent, type LoadedAgent } from "@lib/trading/store";
 import { STRATEGIES, STRATEGY_KINDS, isStrategyKind, type StrategyKind } from "@lib/trading/strategy";
 import { createWallet, walletBalances, WalletError } from "@lib/trading/wallets";
-import { CredBuyError, credMarket, executeCredBuy, quoteCredBuy } from "./cred";
+import { CredBuyError, credBalance, credMarket, executeCredBuy, executeCredSell, quoteCredBuy, quoteCredSell } from "./cred";
 import { bullet, credits } from "./format";
 import { chatConnectionId, connectionsOfKinds, creditsBetween, MEMORY_CHARS, updateChat } from "./store";
 import { timeAgo } from "@lib/format";
@@ -189,9 +189,10 @@ const tradingOverview = define({
     const wallets = await listWallets(context.user.id);
     const walletLines = await Promise.all(
       wallets.map(async (wallet) => {
-        const balances = await walletBalances(wallet.address).catch(() => null);
+        const [balances, cred] = await Promise.all([walletBalances(wallet.address).catch(() => null), credBalance(wallet.address).catch(() => null)]);
         const funds = balances ? `${balances.usdg.toFixed(2)} USDG, ${balances.eth.toFixed(5)} ETH (${usd(balances.totalUsd)})` : "balance not readable right now";
-        return `${wallet.name} ${wallet.address}: ${funds}${wallet.tradingRevokedAt ? " · trading authority REVOKED" : ""}`;
+        const held = cred === null ? "" : `, ${cred.toLocaleString("en-US", { maximumFractionDigits: 0 })} CRED`;
+        return `${wallet.name} ${wallet.address}: ${funds}${held}${wallet.tradingRevokedAt ? " · trading authority REVOKED" : ""}`;
       }),
     );
     const agents = await agentLines(context.user.id);
@@ -547,6 +548,79 @@ const credBuy = define({
   },
 });
 
+async function pickWallet(userId: string, wanted: string | undefined) {
+  const wallets = await listWallets(userId);
+  if (wallets.length === 0) throw new ToolError("The user has no trading wallet yet. Offer to create one with trading.create_wallet.");
+  const query = (wanted ?? "").trim().toLowerCase();
+  const wallet = query
+    ? wallets.find((candidate) => candidate.id === query || candidate.address === query || candidate.name.toLowerCase() === query) ?? wallets.find((candidate) => candidate.name.toLowerCase().includes(query))
+    : wallets.length === 1
+      ? wallets[0]
+      : undefined;
+  if (!wallet) throw new ToolError(`Which wallet? The user has: ${wallets.map((candidate) => `${candidate.name} (${candidate.address})`).join(", ")}.`);
+  if (wallet.tradingRevokedAt) throw new ToolError(`Trading authority is revoked for ${wallet.name}. Restore it on the Wallets page first.`);
+  return wallet;
+}
+
+const credSell = define({
+  name: "cred.sell",
+  summary: "Sell $CRED from the user's trading wallet back to USDG: a real swap on Robinhood Chain, simulated first. Only when the user asked to sell. Needs the user's confirmation.",
+  argsHint: '{"cred": number | "all", "wallet"?: string, "slippagePercent"?: number (default 1, max 5)}',
+  schema: z.object({ cred: z.union([z.literal("all"), z.coerce.number().positive()]), wallet: z.string().max(120).optional(), slippagePercent: z.coerce.number().min(0.1).max(5).optional() }),
+  effect: "write",
+  async prepare(args, context) {
+    if (!env.liveTrading) throw new ToolError("Live trading is switched off on this server, so swaps cannot be signed yet.");
+    const wallet = await pickWallet(context.user.id, args.wallet);
+    const slippagePercent = args.slippagePercent ?? 1;
+    try {
+      const quoted = await quoteCredSell({ walletAddress: wallet.address, cred: args.cred, slippagePercent });
+      return {
+        title: `Sell ${args.cred === "all" ? "all" : args.cred} CRED`,
+        description: quoted.text,
+        args: { walletId: wallet.id, walletAddress: wallet.address, cred: args.cred, slippagePercent },
+        confirmLabel: "Sell CRED",
+      };
+    } catch (error) {
+      throw new ToolError(error instanceof CredBuyError ? error.message : "The sale could not be quoted right now.");
+    }
+  },
+  async run(args, context) {
+    const input = args as unknown as { walletId: string; walletAddress: string; cred: number | "all"; slippagePercent: number };
+    const [wallet] = (await listWallets(context.user.id)).filter((candidate) => candidate.id === input.walletId);
+    if (!wallet) throw new ToolError("That wallet no longer exists.");
+    try {
+      return await executeCredSell({ userId: context.user.id, ...input });
+    } catch (error) {
+      throw new ToolError(error instanceof CredBuyError ? error.message : `The swap failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+  },
+});
+
+const tradingHistory = define({
+  name: "trading.history",
+  summary: "What the user's trading agents and wallets did, from the audit log: approvals, cycles, trades, exits, pauses, swaps. Use for \"what did my agent do yesterday\". Optionally one agent and a number of days (default 1, max 30).",
+  argsHint: '{"agent"?: string, "days"?: number}',
+  schema: z.object({ agent: z.string().max(120).optional(), days: z.coerce.number().min(1).max(30).optional() }),
+  effect: "read",
+  async run(args, context) {
+    const days = args.days ?? 1;
+    const since = new Date(Date.now() - days * 86_400_000);
+    const agent = args.agent ? await findAgent(context.user.id, args.agent) : null;
+    const rows = await db
+      .select({ createdAt: auditEvents.createdAt, actor: auditEvents.actor, summary: auditEvents.summary, automationId: auditEvents.automationId })
+      .from(auditEvents)
+      .where(and(eq(auditEvents.userId, context.user.id), gte(auditEvents.createdAt, since), ...(agent ? [eq(auditEvents.automationId, agent.automation.id)] : [])))
+      .orderBy(desc(auditEvents.createdAt))
+      .limit(60);
+    if (rows.length === 0) return `Nothing in the audit log for the last ${days === 1 ? "day" : `${days} days`}.`;
+    const names = new Map((await db.select({ id: tradingAutomations.id, name: tradingAutomations.name }).from(tradingAutomations).where(eq(tradingAutomations.userId, context.user.id))).map((row) => [row.id, row.name]));
+    return [
+      `${rows.length} events in the last ${days === 1 ? "day" : `${days} days`}, newest first:`,
+      bullet(rows.map((row) => `${timeAgo(row.createdAt)} · ${row.automationId ? `${names.get(row.automationId) ?? "agent"} · ` : ""}${row.actor}: ${row.summary}`)),
+    ].join("\n");
+  },
+});
+
 // ── Automations ─────────────────────────────────────────────────────────────
 
 async function findAutomation(userId: string, query: string) {
@@ -782,6 +856,8 @@ export const BOT_TOOLS: BotToolDef[] = [
   tradingCreateAgent,
   credMarketTool,
   credBuy,
+  credSell,
+  tradingHistory,
   automationsList,
   automationsCreate,
   automationsRun,

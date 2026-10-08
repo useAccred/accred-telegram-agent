@@ -31,7 +31,14 @@ export interface CredDeps {
   snapshot(): Promise<MarketSnapshot | undefined>;
   supply(): Promise<CredSupply>;
   venue(): LiveVenue;
+  balance(address: string): Promise<number>;
   now(): number;
+}
+
+/** CRED held by an address, in whole tokens. */
+export async function credBalance(address: string): Promise<number> {
+  const raw = await publicClient().readContract({ address: CRED.address, abi: erc20Abi, functionName: "balanceOf", args: [address as Hex] });
+  return Number(formatUnits(raw, CRED.decimals));
 }
 
 async function readSupply(): Promise<CredSupply> {
@@ -51,6 +58,7 @@ export const defaultCredDeps: CredDeps = {
   snapshot: async () => (await fetchSnapshots([CRED.address], { fresh: true })).get(CRED.address),
   supply: readSupply,
   venue: () => (sharedVenue ??= createLiveVenue()),
+  balance: credBalance,
   now: () => Date.now(),
 };
 
@@ -170,6 +178,83 @@ export async function executeCredBuy(input: { userId: string; walletId: string; 
     `Transaction: ${EXPLORER_URL}/tx/${fill.txHash}`,
     `The CRED sits in the trading wallet ${input.walletAddress}. Holding 100,000 CRED unlocks the Accred mobile app; paying for credits with CRED earns a 10% bonus and burns the CRED paid.`,
   ].join("\n");
+}
+
+export interface CredSellQuote {
+  quote: LiveQuote;
+  cred: number;
+  expectedUsdg: number;
+  minUsdg: number;
+  impliedPriceUsd: number;
+  walletCred: number;
+  text: string;
+}
+
+/** Quotes and simulates a CRED → USDG swap. `cred` may be "all" for the whole balance. */
+export async function quoteCredSell(input: { walletAddress: string; cred: number | "all"; slippagePercent: number }, deps: CredDeps = defaultCredDeps): Promise<CredSellQuote> {
+  if (!(input.slippagePercent >= 0.1 && input.slippagePercent <= 5)) throw new CredBuyError("Slippage must be between 0.1% and 5%.");
+  const held = await deps.balance(input.walletAddress);
+  const cred = input.cred === "all" ? held : input.cred;
+  if (!(cred > 0)) throw new CredBuyError("Say how much CRED to sell.");
+  if (held <= 0) throw new CredBuyError("The wallet holds no CRED.");
+  if (cred > held) throw new CredBuyError(`The wallet holds ${tokens(held)} CRED, less than the ${tokens(cred)} asked for.`);
+  const venue = deps.venue();
+  const funds = await venue.funds(input.walletAddress);
+  if (!funds) throw new CredBuyError("The wallet's balance could not be read from the chain right now.");
+  if (funds.ethWei < MIN_GAS_WEI) throw new CredBuyError("The wallet needs a little ETH for network fees (about $0.50 worth). Send some ETH to it on Robinhood Chain first.");
+  const snapshot = await deps.snapshot();
+  const quote = await venue.quote({
+    side: "sell",
+    wallet: input.walletAddress,
+    token: CRED.address,
+    amountInRaw: parseUnits(cred.toFixed(CRED.decimals), CRED.decimals),
+    slippagePercent: input.slippagePercent,
+    market: snapshot ?? null,
+    now: deps.now(),
+  });
+  if (!quote.simulation.ok) throw new CredBuyError(`The swap could not be simulated: ${quote.simulation.detail}`);
+  const expectedUsdg = quote.notionalUsd;
+  const minUsdg = Number(formatUnits(BigInt(quote.minOutRaw), USDG.decimals));
+  const impliedPriceUsd = cred > 0 ? expectedUsdg / cred : NaN;
+  const text = [
+    `Sell ${tokens(cred)} CRED${input.cred === "all" ? " (everything)" : ""} from the wallet ${input.walletAddress}?`,
+    bullet([
+      `You receive about ${expectedUsdg.toFixed(2)} USDG (simulated on the chain), at least ${minUsdg.toFixed(2)} with the ${input.slippagePercent}% slippage limit`,
+      `Implied price ${fmtPrice(impliedPriceUsd)}${snapshot ? `, market ${fmtPrice(snapshot.priceUsd)} (impact ${quote.priceImpactPercent.toFixed(2)}%)` : ""}`,
+      `Network fee about ${fmtUsd(quote.networkFeeUsd)} in ETH, paid by the wallet`,
+      `Wallet holds ${tokens(held)} CRED now`,
+    ]),
+    "The swap goes through the pinned router with an approval for exactly this amount. It cannot be undone once sent.",
+  ].join("\n");
+  return { quote, cred, expectedUsdg, minUsdg, impliedPriceUsd, walletCred: held, text };
+}
+
+export async function executeCredSell(input: { userId: string; walletId: string; walletAddress: string; cred: number | "all"; slippagePercent: number }, deps: CredDeps = defaultCredDeps): Promise<string> {
+  const fresh = await quoteCredSell(input, deps);
+  const venue = deps.venue();
+  const fill: Fill = await venue.execute({
+    walletId: input.walletId,
+    quote: fresh.quote,
+    onSigned: async (hash: Hex, nonce: number) => {
+      await audit({ userId: input.userId, walletId: input.walletId, type: "wallet.swap_signed", actor: "user", summary: `Signed a swap of ${tokens(fresh.cred)} CRED for USDG`, data: { hash, nonce, cred: fresh.cred, token: CRED.address, via: "telegram" } });
+    },
+  });
+  if (!fill.ok) {
+    await audit({ userId: input.userId, walletId: input.walletId, type: "wallet.swap_failed", actor: "user", summary: `Swap of ${tokens(fresh.cred)} CRED for USDG failed at ${fill.stage}: ${fill.reason}`, data: { ...fill, via: "telegram" } });
+    if (fill.uncertain && fill.txHash) return `The swap was sent but the chain has not confirmed it yet: ${EXPLORER_URL}/tx/${fill.txHash}. Check that link in a minute; nothing will be sent twice.`;
+    throw new CredBuyError(`The swap did not go through (${fill.stage}): ${fill.reason}${fill.gasUsd > 0 ? ` About ${fmtUsd(fill.gasUsd)} of network fee was spent.` : ""}`);
+  }
+  const sold = Number(formatUnits(fill.inRaw, CRED.decimals));
+  const received = Number(formatUnits(fill.outRaw, USDG.decimals));
+  await audit({
+    userId: input.userId,
+    walletId: input.walletId,
+    type: "wallet.swap_filled",
+    actor: "user",
+    summary: `Sold ${tokens(sold)} CRED for ${received.toFixed(2)} USDG`,
+    data: { txHash: fill.txHash, approveTxHash: fill.approveTxHash, usdg: received, cred: sold, gasUsd: fill.gasUsd, via: "telegram" },
+  });
+  return [`Done. Sold ${tokens(sold)} CRED for ${received.toFixed(2)} USDG (${fmtPrice(received / sold)} each), network fee ${fmtUsd(fill.gasUsd)}.`, `Transaction: ${EXPLORER_URL}/tx/${fill.txHash}`].join("\n");
 }
 
 export { signedUsd };

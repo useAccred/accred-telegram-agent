@@ -62,6 +62,23 @@ export function localHour(instant: number, timezone: string): number {
   return Number(parts.find((part) => part.type === "hour")?.value ?? 0) % 24;
 }
 
+/** Weekday at an instant in a timezone, 0 is Sunday. */
+export function localDay(instant: number, timezone: string): number {
+  const name = new Intl.DateTimeFormat("en-US", { timeZone: timezone, weekday: "short" }).format(new Date(instant));
+  return ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(name);
+}
+
+/** The ISO week of a calendar date, as "2026-W41". */
+export function isoWeek(date: string): string {
+  const [year, month, day] = date.split("-").map(Number) as [number, number, number];
+  const at = new Date(Date.UTC(year, month - 1, day));
+  const weekday = at.getUTCDay() || 7;
+  at.setUTCDate(at.getUTCDate() + 4 - weekday);
+  const yearStart = Date.UTC(at.getUTCFullYear(), 0, 1);
+  const week = Math.ceil(((at.getTime() - yearStart) / 86_400_000 + 1) / 7);
+  return `${at.getUTCFullYear()}-W${String(week).padStart(2, "0")}`;
+}
+
 export function bullet(lines: string[]): string {
   return lines.map((line) => `• ${line}`).join("\n");
 }
