@@ -60,7 +60,8 @@ export function startPolling(token: string, onUpdate: (update: TelegramUpdate) =
           return;
         }
         if (health.consecutiveFailures === 1 || health.consecutiveFailures % 10 === 0) {
-          console.error(`[telegram] getUpdates failed (${health.consecutiveFailures} in a row): ${error instanceof Error ? error.message : error}`);
+          const cause = (error as { cause?: { code?: string; message?: string } }).cause;
+          console.error(`[telegram] getUpdates failed (${health.consecutiveFailures} in a row): ${error instanceof Error ? error.message : error}${cause ? ` (${cause.code ?? ""} ${cause.message ?? ""})` : ""}`);
         }
         // 409 means another process is polling the same bot, or a webhook is set. Back off and retry.
         await sleep(status === 409 ? 15_000 : Math.min(5_000 * health.consecutiveFailures, 30_000));

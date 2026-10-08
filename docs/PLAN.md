@@ -213,8 +213,8 @@ The process also watches itself: the polling loop records when Telegram last ans
 
 | Setting | Default | Range |
 | --- | --- | --- |
-| Per message | 3 credits | 0.1 to 100 |
-| Per day | 50 credits | 1 to 5,000 |
+| Per message | 6 credits | 0.1 to 100 |
+| Per day | 60 credits | 1 to 5,000 |
 | Model mode | Auto | Auto, Economy, Best quality, a pinned model |
 
 Before every model call the worst case is priced as in the runner. A call that would pass either limit is not made, and the bot says which limit stopped it and how to change it. Credits actually charged are recorded per turn, so the daily total is exact.

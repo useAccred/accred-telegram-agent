@@ -8,6 +8,9 @@ export const TRANSCRIPT_BYTES = 16_000;
 export const TRANSCRIPT_MESSAGES = 30;
 export const MEMORY_CHARS = 2_000;
 const ACTION_MINUTES = 10;
+/** Budgets a new chat starts with. A turn with the Auto model and this bot's prompt costs about 3 credits, so 3 was too tight. */
+export const DEFAULT_PER_MESSAGE_MICRO = 6_000_000n;
+export const DEFAULT_PER_DAY_MICRO = 60_000_000n;
 
 export type Transcript = BotChat["transcript"];
 
@@ -20,7 +23,11 @@ export async function getChat(chatId: string): Promise<BotChat | undefined> {
 export async function ensureChat(chatId: string): Promise<BotChat> {
   const existing = await getChat(chatId);
   if (existing) return existing;
-  const [created] = await db.insert(botChats).values({ chatId }).onConflictDoNothing().returning();
+  const [created] = await db
+    .insert(botChats)
+    .values({ chatId, maxPerMessageMicro: DEFAULT_PER_MESSAGE_MICRO, maxPerDayMicro: DEFAULT_PER_DAY_MICRO })
+    .onConflictDoNothing()
+    .returning();
   return created ?? (await getChat(chatId))!;
 }
 
@@ -31,7 +38,7 @@ export async function updateChat(chatId: string, patch: Partial<typeof botChats.
 export async function linkChat(chatId: string, userId: string): Promise<void> {
   await db
     .insert(botChats)
-    .values({ chatId, userId, state: "linked", lastMessageAt: new Date() })
+    .values({ chatId, userId, state: "linked", lastMessageAt: new Date(), maxPerMessageMicro: DEFAULT_PER_MESSAGE_MICRO, maxPerDayMicro: DEFAULT_PER_DAY_MICRO })
     .onConflictDoUpdate({ target: botChats.chatId, set: { userId, state: "linked", transcript: [], updatedAt: new Date() } });
 }
 

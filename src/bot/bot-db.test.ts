@@ -119,6 +119,8 @@ describe.skipIf(!url)("telegram agent against the database", () => {
     expect(user?.keyHint).toBe(key.slice(-4));
     expect(sent[0]?.text).toContain("Connected to your Accred account");
     expect(sent[0]?.text).toContain("1,200.50 credits");
+    expect(chat.maxPerMessageMicro).toBe(6_000_000n);
+    expect(chat.maxPerDayMicro).toBe(60_000_000n);
   });
 
   it("asks for a key first and ignores chatter until one arrives", async () => {
