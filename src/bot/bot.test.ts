@@ -159,3 +159,60 @@ describe("creating an agent from a profile", () => {
     expect(lines.join("\n")).toContain("may trade: TOKEN");
   });
 });
+
+describe("$CRED market", () => {
+  it("reads price from the market and supply from the chain, and computes the market cap net of burned tokens", async () => {
+    const { credMarket, CRED } = await import("./cred");
+    const snapshot = {
+      network: "robinhood" as const,
+      address: CRED.address,
+      symbol: "CRED",
+      name: "Accred",
+      priceUsd: 0.002,
+      liquidityUsd: 120_000,
+      marketCapUsd: null,
+      volumeH1: 1000,
+      volumeH6: 5000,
+      volumeH24: 20_000,
+      priceChangeM5: 0,
+      priceChangeH1: 1.5,
+      priceChangeH6: -2,
+      priceChangeH24: 10,
+      buysH1: 3,
+      sellsH1: 2,
+      pairAddress: "0x" + "ab".repeat(20),
+      pairCreatedAt: null,
+      dex: "uniswap",
+      quoteSymbol: "USDG",
+      fetchedAt: 1_000_000,
+      source: "dexscreener" as const,
+    };
+    const market = await credMarket({
+      snapshot: async () => snapshot,
+      supply: async () => ({ total: 1_000_000_000, burned: 20_000_000, net: 980_000_000 }),
+      venue: () => {
+        throw new Error("not needed");
+      },
+      now: () => 1_003_000,
+    });
+    expect(market.marketCapUsd).toBeCloseTo(1_960_000, 0);
+    expect(market.fullyDilutedUsd).toBeCloseTo(2_000_000, 0);
+    expect(market.text).toContain("Market cap $1,960,000");
+    expect(market.text).toContain("Burned 20,000,000 CRED (2.00%");
+    expect(market.text).toContain("live just now");
+    expect(market.text).toContain("24h +10.00%");
+  });
+
+  it("refuses a buy the wallet cannot pay for before asking the chain for a route", async () => {
+    const { quoteCredBuy } = await import("./cred");
+    const deps = {
+      snapshot: async () => undefined,
+      supply: async () => ({ total: 1, burned: 0, net: 1 }),
+      venue: () => ({ funds: async () => ({ usdg: 5, usdgRaw: 5_000_000n, ethWei: 10n ** 18n }) }) as never,
+      now: () => 0,
+    };
+    await expect(quoteCredBuy({ walletAddress: "0x" + "11".repeat(20), usdg: 50, slippagePercent: 1 }, deps)).rejects.toThrow("holds 5.00 USDG");
+    await expect(quoteCredBuy({ walletAddress: "0x" + "11".repeat(20), usdg: 0.5, slippagePercent: 1 }, deps)).rejects.toThrow("at least 1 USDG");
+    await expect(quoteCredBuy({ walletAddress: "0x" + "11".repeat(20), usdg: 2, slippagePercent: 9 }, deps)).rejects.toThrow("Slippage");
+  });
+});

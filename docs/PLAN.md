@@ -152,6 +152,8 @@ The protocol, parser, router, worst-case pricing and compaction are the ones the
 | `trading.run_now` | **write** | Start a cycle now |
 | `trading.create_wallet` | **write** | Create a dedicated wallet and return its deposit address |
 | `trading.create_agent` | **write** | Create and start a trading agent from a profile, an allocation and an asset list |
+| `cred.market` | read | The live market of $CRED: price, market cap and fully diluted value, burned supply read from the chain, liquidity, volume, changes |
+| `cred.buy` | **write** | Buy CRED with USDG from the user's trading wallet: quoted and simulated through the same route and pinned router as trading agents, sent only after the tap |
 | `automations.list` | read | The user's automations, their schedule and last run |
 | `automations.create` | **write** | Create an automation: instruction, schedule, connections |
 | `automations.run` | **write** | Run an automation now |

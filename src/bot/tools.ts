@@ -20,6 +20,7 @@ import { agentDashboard, listDecisions, listPositions, listTradingAgents, listTr
 import { loadAgent, type LoadedAgent } from "@lib/trading/store";
 import { STRATEGIES, STRATEGY_KINDS, isStrategyKind, type StrategyKind } from "@lib/trading/strategy";
 import { createWallet, walletBalances, WalletError } from "@lib/trading/wallets";
+import { CredBuyError, credMarket, executeCredBuy, quoteCredBuy } from "./cred";
 import { bullet, credits } from "./format";
 import { chatConnectionId, connectionsOfKinds, creditsBetween, MEMORY_CHARS, updateChat } from "./store";
 import { timeAgo } from "@lib/format";
@@ -486,6 +487,66 @@ const tradingCreateAgent = define({
   },
 });
 
+// ── $CRED ───────────────────────────────────────────────────────────────────
+
+const credMarketTool = define({
+  name: "cred.market",
+  summary: "The live market of $CRED, the Accred token on Robinhood Chain: price, market cap, fully diluted value, burned supply (from the chain), liquidity, volume and changes. Use it for any question about CRED's price or market cap.",
+  argsHint: "{}",
+  schema: z.object({}),
+  effect: "read",
+  async run() {
+    try {
+      return (await credMarket()).text;
+    } catch (error) {
+      throw new ToolError(error instanceof Error ? error.message : "The CRED market could not be read.");
+    }
+  },
+});
+
+const credBuy = define({
+  name: "cred.buy",
+  summary: "Buy $CRED with USDG from the user's trading wallet: a real swap on Robinhood Chain, simulated first. Only when the user asked to buy. Needs the user's confirmation.",
+  argsHint: '{"usdg": number (USDG to spend), "wallet"?: string (name or address; omit when the user has one), "slippagePercent"?: number (default 1, max 5)}',
+  schema: z.object({ usdg: z.coerce.number().min(1).max(1_000_000), wallet: z.string().max(120).optional(), slippagePercent: z.coerce.number().min(0.1).max(5).optional() }),
+  effect: "write",
+  async prepare(args, context) {
+    if (!env.liveTrading) throw new ToolError("Live trading is switched off on this server, so swaps cannot be signed yet.");
+    const wallets = await listWallets(context.user.id);
+    if (wallets.length === 0) throw new ToolError("The user has no trading wallet yet. Offer to create one with trading.create_wallet; they then deposit USDG and a little ETH to it, and the buy can go ahead.");
+    const wanted = (args.wallet ?? "").trim().toLowerCase();
+    const wallet = wanted
+      ? wallets.find((candidate) => candidate.id === wanted || candidate.address === wanted || candidate.name.toLowerCase() === wanted) ?? wallets.find((candidate) => candidate.name.toLowerCase().includes(wanted))
+      : wallets.length === 1
+        ? wallets[0]
+        : undefined;
+    if (!wallet) throw new ToolError(`Which wallet? The user has: ${wallets.map((candidate) => `${candidate.name} (${candidate.address})`).join(", ")}.`);
+    if (wallet.tradingRevokedAt) throw new ToolError(`Trading authority is revoked for ${wallet.name}. Restore it on the Wallets page first.`);
+    const slippagePercent = args.slippagePercent ?? 1;
+    try {
+      const quoted = await quoteCredBuy({ walletAddress: wallet.address, usdg: args.usdg, slippagePercent });
+      return {
+        title: `Buy CRED with ${args.usdg} USDG`,
+        description: quoted.text,
+        args: { walletId: wallet.id, walletAddress: wallet.address, usdg: args.usdg, slippagePercent },
+        confirmLabel: "Buy CRED",
+      };
+    } catch (error) {
+      throw new ToolError(error instanceof CredBuyError ? error.message : "The buy could not be quoted right now.");
+    }
+  },
+  async run(args, context) {
+    const input = args as unknown as { walletId: string; walletAddress: string; usdg: number; slippagePercent: number };
+    const [wallet] = (await listWallets(context.user.id)).filter((candidate) => candidate.id === input.walletId);
+    if (!wallet) throw new ToolError("That wallet no longer exists.");
+    try {
+      return await executeCredBuy({ userId: context.user.id, ...input });
+    } catch (error) {
+      throw new ToolError(error instanceof CredBuyError ? error.message : `The swap failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+  },
+});
+
 // ── Automations ─────────────────────────────────────────────────────────────
 
 async function findAutomation(userId: string, query: string) {
@@ -719,6 +780,8 @@ export const BOT_TOOLS: BotToolDef[] = [
   tradingRunNow,
   tradingCreateWallet,
   tradingCreateAgent,
+  credMarketTool,
+  credBuy,
   automationsList,
   automationsCreate,
   automationsRun,
