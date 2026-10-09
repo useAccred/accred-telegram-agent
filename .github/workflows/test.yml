@@ -37,11 +37,10 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - name: Install the engine's dependencies (for drizzle-kit)
-        run: pnpm install --frozen-lockfile --prod=false
-        working-directory: vendor/accred-automation
+      # drizzle-kit comes from this repo's own dependencies; installing inside the submodule would give
+      # TypeScript a second copy of drizzle-orm and the typecheck would see two incompatible types.
       - name: Create the test schema
-        run: pnpm exec drizzle-kit push --force
+        run: ../../node_modules/.bin/drizzle-kit push --force
         working-directory: vendor/accred-automation
       - run: pnpm typecheck
       - run: pnpm test
