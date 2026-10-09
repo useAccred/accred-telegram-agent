@@ -1,0 +1,47 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: accred_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/accred_test
+      TRADING_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/accred_test
+      APP_SECRET: trading-integration-test-secret-0123456789abcdef
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.23.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Install the engine's dependencies (for drizzle-kit)
+        run: pnpm install --frozen-lockfile --prod=false
+        working-directory: vendor/accred-automation
+      - name: Create the test schema
+        run: pnpm exec drizzle-kit push --force
+        working-directory: vendor/accred-automation
+      - run: pnpm typecheck
+      - run: pnpm test
